@@ -18,6 +18,7 @@ House rule: the language model reads the request and writes the summary. Every n
 distance, elevation, air quality, every score — is computed here in Python from API
 responses. The model never produces a metric.
 """
+import concurrent.futures as cf
 import math
 import os
 import re
@@ -318,18 +319,17 @@ def fetch_green(lat: float, lon: float, radius_m: float) -> list:
     if key in _green_cache:
         return _green_cache[key]
     r = int(min(8000, max(1200, radius_m)))
-    q = f"""[out:json][timeout:25];
+    q = f"""[out:json][timeout:8];
 (
-  way["leisure"~"^(park|garden|nature_reserve|recreation_ground|pitch)$"](around:{r},{lat},{lon});
-  way["landuse"~"^(forest|grass|meadow|village_green|greenfield|orchard)$"](around:{r},{lat},{lon});
-  way["natural"~"^(wood|scrub|grassland|water|heath)$"](around:{r},{lat},{lon});
-  way["leisure"="nature_reserve"](around:{r},{lat},{lon});
+  way["leisure"~"^(park|garden|nature_reserve|recreation_ground)$"](around:{r},{lat},{lon});
+  way["landuse"~"^(forest|grass|meadow|village_green)$"](around:{r},{lat},{lon});
+  way["natural"~"^(wood|water|scrub|grassland)$"](around:{r},{lat},{lon});
 );
-out center 400;"""
+out center 250;"""
     pts = []
-    for host in OVERPASS_HOSTS:
+    for host in OVERPASS_HOSTS[:1]:      # one host, one short attempt; never block the plan
         try:
-            resp = requests.post(host, data={"data": q}, timeout=25,
+            resp = requests.post(host, data={"data": q}, timeout=9,
                                  headers={"User-Agent": "route-planner/1.0"})
             if resp.status_code != 200:
                 continue
@@ -436,8 +436,8 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     r = (target_m / 3.0) * 0.78
     bearings = [0, 60, 120, 180, 240, 300][:n]
 
-    out = []
-    for b in bearings:
+    def one(b):
+        """One bearing, one loop. Run these in parallel or the request times out."""
         p1 = offset(lat, lon, b, r)
         p2 = offset(lat, lon, b + 72, r)
         body = {
@@ -452,18 +452,22 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
         try:
             resp = requests.post(ORS_URL.format(profile=profile), json=body,
                                  headers={"Authorization": ORS_KEY,
-                                          "Content-Type": "application/json"}, timeout=30)
+                                          "Content-Type": "application/json"}, timeout=18)
             if resp.status_code != 200:
-                out.append({"error": f"ORS {resp.status_code}: {resp.text[:160]}"})
-                continue
-            out.append(resp.json())
+                return {"error": f"ORS {resp.status_code}: {resp.text[:160]}"}
+            return resp.json()
         except Exception as e:
-            out.append({"error": str(e)})
+            return {"error": str(e)}
+
+    # Six sequential calls at 30s each can exceed the platform request timeout, which
+    # returns an HTML error page and breaks the client. Fan out instead.
+    with cf.ThreadPoolExecutor(max_workers=6) as pool:
+        out = list(pool.map(one, bearings))
 
     # If every bearing failed, fall back to the round_trip helper so the app still
     # returns something rather than an empty page.
     if not any("error" not in x for x in out):
-        for i in range(3):
+        for i in range(2):
             body = {"coordinates": [[lon, lat]], "elevation": True, "instructions": True,
                     "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
                     "options": {"round_trip": {"length": int(target_m), "points": 3 + i,
@@ -472,7 +476,7 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
                 resp = requests.post(ORS_URL.format(profile=profile), json=body,
                                      headers={"Authorization": ORS_KEY,
                                               "Content-Type": "application/json"},
-                                     timeout=30)
+                                     timeout=15)
                 if resp.status_code == 200:
                     out.append(resp.json())
             except Exception:
@@ -745,6 +749,17 @@ def criteria():
 
 @app.post("/api/plan-route")
 def plan_route(req: PlanRequest):
+    """Always returns JSON. A crash here used to surface as an HTML error page,
+    which the browser then failed to parse — an unhelpful error for a real one."""
+    try:
+        return _plan(req)
+    except Exception as e:
+        return {"error": f"Planning failed: {type(e).__name__}: {e}",
+                "detail": ["The server hit an unexpected error. Try a shorter distance "
+                           "or a different start point."]}
+
+
+def _plan(req: PlanRequest):
     if not (-90 <= req.lat <= 90 and -180 <= req.lon <= 180):
         return {"error": "Those coordinates are not on Earth. Check latitude and longitude."}
 
@@ -754,9 +769,17 @@ def plan_route(req: PlanRequest):
     weights = apply_emphasis(base_w, emphasis)
     climb_ideal = next((CLIMB_OVERRIDE[e] for e in emphasis if e in CLIMB_OVERRIDE), None)
 
-    air = fetch_air(req.lat, req.lon)
-    weather = fetch_weather(req.lat, req.lon)
-    green_pts = fetch_green(req.lat, req.lon, parsed["target_m"] * 0.8)
+    # context lookups run together; none of them should be able to stall the plan
+    with cf.ThreadPoolExecutor(max_workers=3) as pool:
+        f_air = pool.submit(fetch_air, req.lat, req.lon)
+        f_wx = pool.submit(fetch_weather, req.lat, req.lon)
+        f_gr = pool.submit(fetch_green, req.lat, req.lon, parsed["target_m"] * 0.8)
+        air = f_air.result()
+        weather = f_wx.result()
+        try:
+            green_pts = f_gr.result(timeout=11)
+        except Exception:
+            green_pts = []
 
     try:
         raw = fetch_routes(req.lat, req.lon, parsed["target_m"], parsed["activity"],
