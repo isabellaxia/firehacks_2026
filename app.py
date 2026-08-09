@@ -174,6 +174,8 @@ def s_green(extras: dict, osm_fraction: float | None = None) -> tuple[float, boo
     The 85.0 baseline from the brief only appears if all three are unavailable,
     and it is flagged as estimated so the interface can say so.
     """
+    signals, weights = [], []
+
     block = (extras or {}).get("green")
     if block and block.get("values"):
         num = den = 0.0
@@ -182,23 +184,29 @@ def s_green(extras: dict, osm_fraction: float | None = None) -> tuple[float, boo
             num += (int(val) / 10.0) * span
             den += span
         if den:
-            base = num / den
-            if osm_fraction is not None:
-                base = 0.7 * base + 0.3 * min(1.0, osm_fraction * 1.4)
-            return 100.0 * base, True
+            signals.append(num / den)
+            weights.append(0.45)
 
-    wt = _extra_fraction(extras, "waytypes", WAYTYPE_GREEN, 0)
+    # Path type and surface always vary between routes, so they are what keeps this
+    # criterion able to tell candidates apart. ORS's own green index reads the same
+    # on every street in a suburban grid, which is why blending matters.
+    wt = _extra_fraction(extras, "waytype", WAYTYPE_GREEN, 0)
+    if wt is not None:
+        signals.append(min(1.0, (wt / 100.0) * 1.5))
+        weights.append(0.35)
     sf = _extra_fraction(extras, "surface", SURFACE_GREEN, 0)
-    parts = [x / 100.0 for x in (wt, sf) if x is not None]
-    if parts:
-        base = sum(parts) / len(parts)
-        if osm_fraction is not None:
-            base = 0.55 * base + 0.45 * min(1.0, osm_fraction * 1.4)
-        return 100.0 * min(1.0, base * 1.6), True
+    if sf is not None:
+        signals.append(min(1.0, (sf / 100.0) * 1.5))
+        weights.append(0.20)
 
     if osm_fraction is not None:
-        return 100.0 * min(1.0, osm_fraction * 1.35), True
-    return 85.0, False
+        signals.append(min(1.0, osm_fraction * 1.4))
+        weights.append(0.35)
+
+    if not signals:
+        return 85.0, False
+    total = sum(weights)
+    return 100.0 * sum(v * w for v, w in zip(signals, weights)) / total, True
 
 
 # How loud each road class is to walk beside. Traffic volume is the dominant
@@ -223,13 +231,13 @@ def s_noise(extras: dict) -> tuple[float, bool]:
             den += span
         if den:
             return 100.0 * (num / den), True
-    v = _extra_fraction(extras, "waytypes", WAYTYPE_QUIET, 0)
+    v = _extra_fraction(extras, "waytype", WAYTYPE_QUIET, 0)
     return (v, True) if v is not None else (70.0, False)
 
 
 def s_safety(extras: dict, steps: int, km: float) -> tuple[float, bool]:
     """Separated paths beat streets beat state roads; frequent junctions cost."""
-    base = _extra_fraction(extras, "waytypes", WAYTYPE_SAFETY, 0)
+    base = _extra_fraction(extras, "waytype", WAYTYPE_SAFETY, 0)
     real = base is not None
     if base is None:
         base = 90.0                 # brief's baseline
@@ -860,6 +868,10 @@ def _plan(req: PlanRequest):
         for k in routes[0]["scores"]:
             vals = [r["scores"][k] for r in routes]
             spread[k] = round(max(vals) - min(vals), 1)
+    # Air and weather are measured once at the start point, so they are the same for
+    # every candidate by definition. That is not a broken slider, and the interface
+    # should say so rather than implying the knob is faulty.
+    uniform_by_design = ["air", "weather"]
 
     routes.sort(key=lambda r: -r["score"])
     for rank, r in enumerate(routes, 1):
@@ -917,6 +929,7 @@ def _plan(req: PlanRequest):
         "weather": weather,
         "daylight": daylight,
         "spread": spread,
+        "uniform_by_design": uniform_by_design,
         "green_features": len(green_pts),
         "summary": summary,
         "routes": routes,
@@ -1396,7 +1409,7 @@ const PAINT = {
   noise:     {label:'Noise',      scale:v => v/10,        good:'low'},
   steepness: {label:'Steepness',  scale:v => Math.min(1, Math.abs(v)/5), good:'low'},
   surface:   {label:'Surface',    scale:v => 1 - (SURF[v] ?? .5), good:'low'},
-  waytypes:  {label:'Path type',  scale:v => 1 - (WAY[v] ?? .5),  good:'low'},
+  waytype:   {label:'Path type',  scale:v => 1 - (WAY[v] ?? .5),  good:'low'},
 };
 const SURF = {1:.80,2:.95,3:.90,4:.85,5:.70,6:.60,7:.55,8:.45,9:.50,10:.40,11:.55,
               12:.35,13:.30,14:.25,15:.40,16:.65,17:.30,18:.20,20:.50};
@@ -1525,12 +1538,17 @@ function sliderPanel() {
        same on every candidate, so moving it honestly cannot change anything.</p>
     ${Object.keys(w).map(k => {
       const sp = (DATA.spread || {})[k] ?? 99;
+      const byDesign = (DATA.uniform_by_design || []).includes(k);
       const dead = sp < 2;
-      return `<div class="sl" title="${dead
+      const note = byDesign
+        ? ' <span style="font-size:9px">(same for all)</span>'
+        : dead ? ' <span style="font-size:9px">(tied)</span>' : '';
+      return `<div class="sl" title="${byDesign
+        ? 'Measured once at your start point, so it is identical for every candidate'
+        : dead
         ? 'Every candidate scores the same here, so this slider cannot change the ranking'
         : 'Candidates differ by ' + sp + ' points on this criterion'}">
-      <span style="${dead ? 'opacity:.45' : ''}">${esc(LABELS[k] || k)}${
-        dead ? ' <span style="font-size:9px">(tied)</span>' : ''}</span>
+      <span style="${dead ? 'opacity:.45' : ''}">${esc(LABELS[k] || k)}${note}</span>
       <input type="range" min="0" max="40" value="${Math.round(w[k] * 100)}"
         data-w="${k}" ${dead ? 'style="opacity:.4"' : ''}>
       <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`;
