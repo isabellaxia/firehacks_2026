@@ -558,11 +558,13 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
 
     # A triangle start -> p1 -> p2 -> start of side r has perimeter about 3r along
     # straight lines; real streets add roughly 25%, so aim a little short.
-    r = (target_m / 3.0) * 0.78
+    r = target_m / 4.0
     # Alternating the reach as well as the bearing pushes some loops further out,
     # where the streets, surfaces and greenery genuinely differ from the blocks
     # right around the start.
-    spread = [(0, 1.0), (60, 0.75), (120, 1.15), (180, 1.0), (240, 0.75), (300, 1.15)]
+    # Reach stays in a narrow band so every candidate lands near the requested
+    # distance. Direction is what varies, not length.
+    spread = [(0, 1.0), (60, 0.92), (120, 1.08), (180, 1.0), (240, 0.92), (300, 1.08)]
 
     # green_bias > 0 means the runner wants greenery: aim loops straight at the
     # densest parks nearby. green_bias < 0 means they do not: aim away from them.
@@ -571,36 +573,23 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     # The bias is continuous, so the candidate mix should be too. At bias 0.3 one
     # loop chases the nearest park; at 1.0 nearly all of them do, and they aim
     # tighter. Nudging the slider nudges the route rather than flipping it.
+    # Six candidates spanning the greenery spectrum: level 0 heads away from the
+    # green land, level 5 heads straight into it, and the four between interpolate.
+    # The user then scrubs through them instantly instead of waiting for a re-plan.
     bearings = []
-    if hotspots and abs(green_bias) > 0.12:
-        strength = min(1.0, abs(green_bias))
-        n_seek = max(1, round(strength * (n - 1)))
-        spreadf = 55 * (1.0 - strength) + 12      # tight aim at full strength
-        nearest = hotspots[0]["distance_m"]
-        # If the start already sits in or beside the green, "seek" means circling
-        # inside it, not striking out toward a distant cluster — and "avoid" means
-        # leaving. Getting this backwards is why a start next to a park could send
-        # every loop away from it.
-        inside = nearest < max(350.0, r * 0.35)
-        for i in range(n_seek):
-            h = hotspots[min(i // 2, len(hotspots) - 1)]
-            if inside and green_bias > 0:
-                # fan out around the green you are already in, short reach
-                b = (i * (360.0 / max(1, n_seek))) % 360
-                reach = 0.55 + 0.1 * (i % 2)
-            elif inside and green_bias < 0:
-                b = (h["bearing"] + 180 + (spreadf if i % 2 else -spreadf) * 0.4) % 360
-                reach = 1.25
-            else:
-                b = h["bearing"] if green_bias > 0 else (h["bearing"] + 180) % 360
-                b = (b + (spreadf if i % 2 else -spreadf) * (i // 2 + 1) * 0.5) % 360
-                reach = max(0.5, min(1.4, h["distance_m"] / max(1.0, r))) \
-                    if green_bias > 0 else 1.0
-            bearings.append((b, reach))
-    for spec in spread:
-        if len(bearings) >= n:
-            break
-        bearings.append(spec)
+    if hotspots:
+        toward = hotspots[0]["bearing"]
+        away = (toward + 180.0) % 360.0
+        for i in range(n):
+            t = i / max(1, n - 1)                     # 0 = away, 1 = toward
+            # walk the short way round the circle from 'away' to 'toward'
+            diff = ((toward - away + 540) % 360) - 180
+            b = (away + diff * t) % 360
+            # nudge alternate levels sideways so no two loops overlap exactly
+            b = (b + (14 if i % 2 else -14)) % 360
+            bearings.append((b, 0.94 + 0.10 * t))
+    else:
+        bearings = spread[:n]
     bearings = bearings[:n]
 
     def one(spec):
@@ -1085,20 +1074,18 @@ def _plan(req: PlanRequest):
     # Air and weather are measured once at the start point, so they are the same for
     # every candidate by definition. That is not a broken slider, and the interface
     # should say so rather than implying the knob is faulty.
-    uniform_by_design = ["air", "weather"]
-
-    routes.sort(key=lambda r: -r["score"])
-    for rank, r in enumerate(routes, 1):
-        r["rank"] = rank
-    # Drop loops that cover the same ground. Two routes are "the same" if their
-    # midpoints and their bounding boxes nearly coincide — distance alone is not
-    # enough, since two different loops can be the same length.
+    # Drop loops that cover the same ground, and loops that missed the requested
+    # distance badly. A five mile request must not return a fifteen mile loop.
     def signature(r):
         cs = r["geojson"]["geometry"]["coordinates"]
         lats = [c[1] for c in cs]
         lons = [c[0] for c in cs]
         return (round(sum(lats) / len(lats), 3), round(sum(lons) / len(lons), 3),
                 round(max(lats) - min(lats), 3), round(max(lons) - min(lons), 3))
+
+    for r in routes:
+        r["distance_error_pct"] = round(
+            100.0 * (r["distance_m"] - parsed["target_m"]) / parsed["target_m"])
 
     seen, unique = set(), []
     for r in routes:
@@ -1107,7 +1094,46 @@ def _plan(req: PlanRequest):
             continue
         seen.add(sig)
         unique.append(r)
-    routes = unique[:6]
+
+    TOL = 40
+    on_target = [r for r in unique if abs(r["distance_error_pct"]) <= TOL]
+    if len(on_target) < 2:
+        # never return nothing: keep the closest few and say they are off target
+        on_target = sorted(unique, key=lambda r: abs(r["distance_error_pct"]))[:3]
+    routes = on_target[:6]
+
+    spread = {}
+    if len(routes) > 1:
+        for k in routes[0]["scores"]:
+            vals = [r["scores"][k] for r in routes]
+            spread[k] = round(max(vals) - min(vals), 1)
+
+    if len(routes) > 1:
+        for k in routes[0]["scores"]:
+            vals = [r["scores"][k] for r in routes]
+            lo, hi = min(vals), max(vals)
+            rng = hi - lo
+            for r in routes:
+                r.setdefault("rel", {})
+                r["rel"][k] = round(50.0 if rng < 0.5
+                                    else 100.0 * (r["scores"][k] - lo) / rng, 1)
+        for r in routes:
+            r["score"] = round(sum(weights[k] * r["rel"][k] for k in weights), 1)
+    else:
+        for r in routes:
+            r["rel"] = dict(r["scores"])
+
+    # Order the list as a ladder: least green first, greenest last. Whatever the
+    # candidates turned out to be, the list always ascends in greenery, so scrubbing
+    # through it always shows the route getting greener.
+    routes.sort(key=lambda r: r["scores"]["green"])
+    n_levels = max(1, len(routes) - 1)
+    for i, r in enumerate(routes):
+        r["green_level"] = i
+        r["green_level_pct"] = round(100 * i / n_levels)
+        r["rank"] = i + 1
+
+    uniform_by_design = ["air", "weather"]
 
     # Will they still be out after dark? Real times, computed here.
     daylight = None
@@ -1546,15 +1572,19 @@ function renderCands() {
   const d = DATA;
   document.getElementById('cands').innerHTML = d.routes.map((r, i) => `
     <button class="cand ${i === SELECTED ? 'on' : ''}" data-i="${i}">
-      <div class="top"><span class="bib">${r.score.toFixed(0)}</span>
+      <div class="top"><span class="bib">${(r.green_level ?? i) + 1}</span>
         ${r.delta ? `<span style="font-family:var(--m);font-size:11px;color:${
           r.delta > 0 ? 'var(--good)' : 'var(--warn)'}">${
           r.delta > 0 ? '+' : ''}${r.delta}</span>` : ''}
         <span><b style="font-family:var(--d);font-size:17px">${r.distance_mi} mi</b>
           <span style="color:var(--dim);font-size:12px"> · ${r.distance_km} km</span>
-          <div class="facts">${r.estimated_minutes} min · <b>${r.elevation_gain_m} m</b> climb
-            · <b>${r.turns}</b> turns · AQI <b>${r.aqi}</b></div></span></div>
-      <div class="bar"><i style="width:${r.score}%"></i></div>
+          <div class="facts">greenery <b>${Math.round(r.scores.green)}</b>/100
+            · ${r.estimated_minutes} min · <b>${r.elevation_gain_m} m</b> climb
+            · <b>${r.turns}</b> turns${
+            Math.abs(r.distance_error_pct ?? 0) > 12
+              ? ` · <span style="color:var(--warn)">${r.distance_error_pct > 0 ? '+' : ''}${
+                  r.distance_error_pct}% vs target</span>` : ''}</div></span></div>
+      <div class="bar"><i style="width:${Math.max(3, r.scores.green)}%"></i></div>
       <div class="breakdown">
         ${Object.keys(r.scores).map(k => critRow(k, r.scores[k], r.weights[k],
             r.estimated[k])).join('')}
@@ -1605,11 +1635,20 @@ function wireSliders() {
   });
   showPull();
   const dial = document.getElementById('greendial');
-  if (dial) dial.value = Math.round((DATA.green_bias ?? 0) * 100);
+  if (dial) {
+    dial.value = Math.round((DATA.green_bias ?? 0) * 100);
+    dial.addEventListener('input', () => {
+      const n = DATA.routes.length;
+      const t = (+dial.value + 100) / 200;
+      select(Math.max(0, Math.min(n - 1, Math.round(t * (n - 1)))));
+      const el = document.getElementById('pulls');
+      if (el) el.innerHTML = `Greenery dial — showing loop <b>${
+        Math.round(t * (n - 1)) + 1} of ${n}</b>, least green on the left.`;
+    });
+  }
   const rp = document.getElementById('replan');
   if (rp) rp.addEventListener('click', async () => {
     const bias = (+((dial && dial.value) || 0)) / 100;
-    if (dial) USER_W = null;
     rp.disabled = true;
     rp.innerHTML = '<span class="spin"></span>Finding new routes';
     try {
@@ -1846,11 +1885,11 @@ function sliderPanel() {
         <input type="range" min="-100" max="100" value="0" id="greendial">
         <span style="font-size:10px;text-align:right">seek out</span>
       </div>
-      <button class="replan" id="replan">Find new routes at this setting</button>
       <p style="font-size:10.5px;color:var(--dim);margin:7px 0 0;line-height:1.5">
-        The sliders above re-rank the loops you already have, instantly. This dial
-        asks for <em>new</em> loops, aimed at the nearest parks or away from them.
-        The further you push it, the more of the six candidates chase the green.</p>
+        Every loop below was planned at a different greenery level, least green on
+        the left. Drag this, or any slider above, to scrub through them — it is
+        instant, because all six are already loaded.</p>
+      <button class="replan" id="replan">Plan a fresh set of loops</button>
     </div>
     <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
   </div>`;
@@ -1866,21 +1905,26 @@ function combinedPull() {
 
 function showPull() {
   const el = document.getElementById('pulls');
-  if (!el) return;
-  const p = combinedPull();
+  if (!el || !DATA) return;
+  const p = combinedPull(), n = DATA.routes.length;
+  const idx = Math.max(0, Math.min(n - 1, Math.round(((p + 1) / 2) * (n - 1))));
   const dir = p > 0.12 ? '<span class="g">toward green land</span>'
             : p < -0.12 ? '<span class="s">toward the street grid</span>'
             : 'balanced';
-  el.innerHTML = `Combined pull: <b>${p >= 0 ? '+' : ''}${p.toFixed(2)}</b> — ${dir}.
-    ${Math.abs(p) > 0.12 ? 'New loops are being planned to match.' : ''}`;
+  el.innerHTML = `Combined pull <b>${p >= 0 ? '+' : ''}${p.toFixed(2)}</b> — ${dir}.
+    Showing loop <b>${idx + 1} of ${n}</b> on the greenery ladder.`;
   const dl = document.getElementById('greendial');
   if (dl) dl.value = Math.round(p * 100);
 }
 
-let REPLAN_TIMER = null;
+/* The six loops already span the greenery spectrum, so the combined pull just
+   picks which rung to show. Instant, no request, nothing to wait for. */
 function scheduleReplan() {
-  clearTimeout(REPLAN_TIMER);
-  REPLAN_TIMER = setTimeout(() => doReplan(combinedPull()), 500);
+  const n = DATA.routes.length;
+  if (!n) return;
+  const p = combinedPull();                       // -1 .. +1
+  const idx = Math.max(0, Math.min(n - 1, Math.round(((p + 1) / 2) * (n - 1))));
+  select(idx);
 }
 
 async function doReplan(bias) {
@@ -1992,7 +2036,7 @@ function render(d) {
         : d.green_bias < -0.15 ? '— loops aimed away from it' : ''}</div>` : ''}
     <div id="paintbar"></div>
     <div id="slidebox"></div>
-    <label>Candidate loops &mdash; ${d.routes.length} different directions</label>
+    <label>Greenery ladder &mdash; ${d.routes.length} loops, least green first</label>
     <div id="cands"></div>
     <p class="note">Air data: ${esc(a.source||'—')}. Greenery measured against
       ${d.green_features || 0} parks, woods and water features from OpenStreetMap. Distance parsed by ${esc(d.request.parsed_by)}.
