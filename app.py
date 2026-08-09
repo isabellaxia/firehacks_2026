@@ -294,14 +294,31 @@ def fetch_weather(lat: float, lon: float) -> dict:
         return {}
 
 
-def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
-                 emphasis: list[str] | None = None, n: int = 5) -> list[dict]:
-    """Round trips from OpenRouteService. Different seeds give genuinely different loops.
+def offset(lat: float, lon: float, bearing_deg: float, metres: float):
+    """Move a point along a compass bearing. Plain great-circle maths."""
+    R = 6371000.0
+    br = math.radians(bearing_deg)
+    d = metres / R
+    p1, l1 = math.radians(lat), math.radians(lon)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(br))
+    l2 = l1 + math.atan2(math.sin(br) * math.sin(d) * math.cos(p1),
+                         math.cos(d) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), math.degrees(l2)
 
-    Preferences change the request itself, not just the ranking afterwards: asking for
-    a safe route makes ORS avoid steps and ferries, and asking for green or quiet
-    switches ORS to its green/quiet profile weighting. Five candidates instead of
-    three, because re-ranking can only pick from what came back.
+
+def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
+                 emphasis: list[str] | None = None, n: int = 6) -> list[dict]:
+    """Candidate loops that are actually different from one another.
+
+    OpenRouteService's round_trip helper reseeded a few times tends to return the
+    same loop with minor variations, which is useless: re-weighting the score can
+    only choose between the routes you gave it. So instead of reseeding, we send
+    the loop off in a different COMPASS DIRECTION each time — two via-points placed
+    on a bearing, routed start -> p1 -> p2 -> start. Six bearings, six loops that
+    fan out across the map and genuinely trade off against each other.
+
+    Preferences also change the request itself: asking for a safe route makes ORS
+    avoid steps and ferries, so the geometry differs too, not just the ranking.
     """
     if not ORS_KEY:
         raise RuntimeError("ORS_API_KEY is not set")
@@ -314,38 +331,52 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     elif "flat" in emphasis:
         avoid = ["steps"]
 
-    # ORS exposes alternative weightings for foot and cycling profiles.
-    if "green" in emphasis or "scenic" in emphasis:
-        pref = "recommended"
-    elif "exact" in emphasis:
-        pref = "shortest"
-    else:
-        pref = "recommended"
+    # A triangle start -> p1 -> p2 -> start of side r has perimeter about 3r along
+    # straight lines; real streets add roughly 25%, so aim a little short.
+    r = (target_m / 3.0) * 0.78
+    bearings = [0, 60, 120, 180, 240, 300][:n]
 
     out = []
-    for i in range(n):
-        opts = {"round_trip": {"length": int(target_m), "points": 3 + i,
-                               "seed": 1 + i * 11}}
-        if avoid:
-            opts["avoid_features"] = avoid
+    for b in bearings:
+        p1 = offset(lat, lon, b, r)
+        p2 = offset(lat, lon, b + 72, r)
         body = {
-            "coordinates": [[lon, lat]],
+            "coordinates": [[lon, lat], [p1[1], p1[0]], [p2[1], p2[0]], [lon, lat]],
             "elevation": True,
             "instructions": True,
-            "preference": pref,
+            "preference": "shortest" if "exact" in emphasis else "recommended",
             "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
-            "options": opts,
         }
+        if avoid:
+            body["options"] = {"avoid_features": avoid}
         try:
-            r = requests.post(ORS_URL.format(profile=profile), json=body,
-                              headers={"Authorization": ORS_KEY,
-                                       "Content-Type": "application/json"}, timeout=35)
-            if r.status_code != 200:
-                out.append({"error": f"ORS {r.status_code}: {r.text[:200]}"})
+            resp = requests.post(ORS_URL.format(profile=profile), json=body,
+                                 headers={"Authorization": ORS_KEY,
+                                          "Content-Type": "application/json"}, timeout=30)
+            if resp.status_code != 200:
+                out.append({"error": f"ORS {resp.status_code}: {resp.text[:160]}"})
                 continue
-            out.append(r.json())
+            out.append(resp.json())
         except Exception as e:
             out.append({"error": str(e)})
+
+    # If every bearing failed, fall back to the round_trip helper so the app still
+    # returns something rather than an empty page.
+    if not any("error" not in x for x in out):
+        for i in range(3):
+            body = {"coordinates": [[lon, lat]], "elevation": True, "instructions": True,
+                    "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
+                    "options": {"round_trip": {"length": int(target_m), "points": 3 + i,
+                                               "seed": 1 + i * 11}}}
+            try:
+                resp = requests.post(ORS_URL.format(profile=profile), json=body,
+                                     headers={"Authorization": ORS_KEY,
+                                              "Content-Type": "application/json"},
+                                     timeout=30)
+                if resp.status_code == 200:
+                    out.append(resp.json())
+            except Exception:
+                pass
     return out
 
 
@@ -652,15 +683,24 @@ def plan_route(req: PlanRequest):
     routes.sort(key=lambda r: -r["score"])
     for rank, r in enumerate(routes, 1):
         r["rank"] = rank
-    # drop near-duplicate loops so the list shows genuinely different options
+    # Drop loops that cover the same ground. Two routes are "the same" if their
+    # midpoints and their bounding boxes nearly coincide — distance alone is not
+    # enough, since two different loops can be the same length.
+    def signature(r):
+        cs = r["geojson"]["geometry"]["coordinates"]
+        lats = [c[1] for c in cs]
+        lons = [c[0] for c in cs]
+        return (round(sum(lats) / len(lats), 3), round(sum(lons) / len(lons), 3),
+                round(max(lats) - min(lats), 3), round(max(lons) - min(lons), 3))
+
     seen, unique = set(), []
     for r in routes:
-        sig = (round(r["distance_m"] / 120), round(r["elevation_gain_m"] / 12))
+        sig = signature(r)
         if sig in seen:
             continue
         seen.add(sig)
         unique.append(r)
-    routes = unique[:4]
+    routes = unique[:6]
 
     # Will they still be out after dark? Real times, computed here.
     daylight = None
@@ -1077,6 +1117,9 @@ function renderCands() {
   document.getElementById('cands').innerHTML = d.routes.map((r, i) => `
     <button class="cand ${i === SELECTED ? 'on' : ''}" data-i="${i}">
       <div class="top"><span class="bib">${r.score.toFixed(0)}</span>
+        ${r.delta ? `<span style="font-family:var(--m);font-size:11px;color:${
+          r.delta > 0 ? 'var(--good)' : 'var(--warn)'}">${
+          r.delta > 0 ? '+' : ''}${r.delta}</span>` : ''}
         <span><b style="font-family:var(--d);font-size:17px">${r.distance_mi} mi</b>
           <span style="color:var(--dim);font-size:12px"> · ${r.distance_km} km</span>
           <div class="facts">${r.estimated_minutes} min · <b>${r.elevation_gain_m} m</b> climb
@@ -1316,10 +1359,13 @@ function rescore() {
   const w = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v / tot]));
   const before = DATA.routes.map(r => r.id).join(',');
   DATA.routes.forEach(r => {
+    const prev = r.score;
     r.score = +Object.keys(w).reduce((s, k) => s + w[k] * r.scores[k], 0).toFixed(1);
+    r.delta = +(r.score - prev).toFixed(1);
     r.weights = w;
   });
   DATA.routes.sort((a, b) => b.score - a.score);
+  SELECTED = 0;
   renderCands();
   const after = DATA.routes.map(r => r.id).join(',');
   const el = document.getElementById('reorder');
@@ -1382,7 +1428,7 @@ function render(d) {
     <div class="summary"><div class="tagline">Recommendation</div>${esc(d.summary)}</div>
     <div id="paintbar"></div>
     <div id="slidebox"></div>
-    <label>Candidate loops</label>
+    <label>Candidate loops &mdash; ${d.routes.length} different directions</label>
     <div id="cands"></div>
     <p class="note">Air data: ${esc(a.source||'—')}. Distance parsed by ${esc(d.request.parsed_by)}.
       Scores are computed in Python from routing, elevation, air and weather data —
