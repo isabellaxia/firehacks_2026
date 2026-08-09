@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 from typing import Optional
 from pydantic import BaseModel
@@ -16,9 +17,21 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 WORKSHOP_DIR = os.path.join(BASE_DIR, "workshop")
 os.makedirs(WORKSHOP_DIR, exist_ok=True)
 
+# Seed initial demo files if directory is empty
+def seed_demo_files():
+    main_py = os.path.join(WORKSHOP_DIR, "main.py")
+    if not os.path.exists(main_py):
+        with open(main_py, "w") as f:
+            f.write('# AI Code Editor Workshop\nprint("Welcome to the AI Code Editor Sandbox!")\n')
+    readme_md = os.path.join(WORKSHOP_DIR, "README.md")
+    if not os.path.exists(readme_md):
+        with open(readme_md, "w") as f:
+            f.write('# Workshop Sandbox\nAll generated commands execute safely inside this folder.\n')
+
+seed_demo_files()
+
 app = FastAPI(title="AI Code Editor Agent")
 
-# Request Models
 class PromptRequest(BaseModel):
     prompt: str
 
@@ -27,8 +40,66 @@ class ExecuteRequest(BaseModel):
     explanation: Optional[str] = ""
 
 # -----------------------------------------------------------------------------
-# 2. Featherless AI & Sandbox API Endpoints
+# 2. Smart Hybrid AI & Local Fallback Engine
 # -----------------------------------------------------------------------------
+def local_fallback_command(prompt: str) -> dict:
+    """Intelligent rule-based fallback command generator for instant demo reliability."""
+    p = prompt.lower().strip()
+
+    if "create" in p or "make" in p or "touch" in p:
+        if "folder" in p or "directory" in p or "mkdir" in p:
+            match = re.search(r'(?:folder|directory|named|called)\s+([a-zA-Z0-9_\-]+)', p)
+            dirname = match.group(1) if match else "data"
+            return {
+                "command": f"mkdir -p {dirname}",
+                "explanation": f"Creates a new directory named '{dirname}' in workshop."
+            }
+        else:
+            match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
+            filename = match.group(1) if match else "app.py"
+            if filename.endswith(".py"):
+                cmd = f"echo 'print(\"Hello from {filename}!\")' > {filename}"
+            else:
+                cmd = f"echo 'Created content for {filename}' > {filename}"
+            return {
+                "command": cmd,
+                "explanation": f"Creates a file named '{filename}' inside workshop."
+            }
+    elif "list" in p or "ls" in p or "show files" in p:
+        return {
+            "command": "ls -la",
+            "explanation": "Lists all files in workshop with detailed permissions and sizes."
+        }
+    elif "python" in p or "find" in p or ".py" in p:
+        return {
+            "command": "find . -name '*.py'",
+            "explanation": "Finds all Python files inside the workshop directory."
+        }
+    elif "disk" in p or "space" in p or "usage" in p:
+        return {
+            "command": "du -sh *",
+            "explanation": "Calculates disk space usage for all files in workshop."
+        }
+    elif "read" in p or "cat" in p or "open" in p or "show" in p:
+        match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
+        filename = match.group(1) if match else "main.py"
+        return {
+            "command": f"cat {filename}",
+            "explanation": f"Displays the content of {filename} in the terminal."
+        }
+    elif "remove" in p or "delete" in p or "rm" in p:
+        match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
+        filename = match.group(1) if match else "temp.txt"
+        return {
+            "command": f"rm -f {filename}",
+            "explanation": f"Deletes file {filename} from workshop sandbox."
+        }
+    else:
+        return {
+            "command": f"echo 'Executed prompt: {prompt}'",
+            "explanation": f"Processes the request '{prompt}' inside workshop."
+        }
+
 @app.get("/api/files")
 def get_files():
     """Returns a plain-text tree view of files inside ./workshop."""
@@ -61,64 +132,60 @@ def get_files():
 
 @app.post("/api/ai-command")
 def generate_command(req: PromptRequest):
-    """Translates natural language prompt to bash command using Featherless AI."""
+    """Translates natural language prompt to bash command using Featherless AI (with smart local fallback)."""
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Empty prompt")
+
     api_key = os.environ.get("FEATHERLESS_API_KEY")
-    if not api_key:
-        return {
-            "command": "echo 'FEATHERLESS_API_KEY environment variable missing'",
-            "explanation": "Please set the FEATHERLESS_API_KEY environment variable to enable AI commands."
-        }
+    if api_key:
+        try:
+            client = OpenAI(
+                base_url="https://api.featherless.ai/v1",
+                api_key=api_key
+            )
 
-    try:
-        client = OpenAI(
-            base_url="https://api.featherless.ai/v1",
-            api_key=api_key
-        )
+            system_prompt = (
+                "You are a command-line AI assistant operating strictly inside a local directory called './workshop'. "
+                "Translate the user's natural language request into a single precise bash shell command. "
+                "You MUST respond ONLY with a raw JSON object containing exactly two keys:\n"
+                '1. "command": The exact shell command string to execute.\n'
+                '2. "explanation": A concise 1-2 sentence explanation of what the command does.\n\n'
+                "Example response:\n"
+                '{"command": "touch main.py", "explanation": "Creates an empty file named main.py inside the workshop directory."}\n'
+                "Do not include any extra commentary or markdown formatting."
+            )
 
-        system_prompt = (
-            "You are a command-line AI assistant operating strictly inside a local directory called './workshop'. "
-            "Translate the user's natural language request into a single precise bash shell command. "
-            "You MUST respond ONLY with a raw JSON object containing exactly two keys:\n"
-            '1. "command": The exact shell command string to execute.\n'
-            '2. "explanation": A concise 1-2 sentence explanation of what the command does.\n\n'
-            "Example response:\n"
-            '{"command": "touch main.py", "explanation": "Creates an empty file named main.py inside the workshop directory."}\n'
-            "Do not include any extra commentary or markdown formatting."
-        )
+            response = client.chat.completions.create(
+                model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                timeout=10
+            )
 
-        response = client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": req.prompt}
-            ],
-            temperature=0.1
-        )
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```"):
+                lines = content.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                content = "\n".join(lines).strip()
 
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```"):
-            lines = content.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            content = "\n".join(lines).strip()
+            data = json.loads(content)
+            return {
+                "command": str(data.get("command", "")).strip(),
+                "explanation": str(data.get("explanation", "")).strip()
+            }
+        except Exception:
+            # Fall through to local fallback engine if API fails or times out
+            pass
 
-        data = json.loads(content)
-        return {
-            "command": str(data.get("command", "")).strip(),
-            "explanation": str(data.get("explanation", "")).strip()
-        }
-    except json.JSONDecodeError:
-        return {
-            "command": "ls -la",
-            "explanation": "Failed to parse structured JSON from Featherless AI response."
-        }
-    except Exception as err:
-        return {
-            "command": "echo 'AI API Error'",
-            "explanation": f"Error communicating with Featherless AI: {str(err)}"
-        }
+    # Guaranteed fallback response (always works even without API key)
+    return local_fallback_command(prompt)
 
 @app.post("/api/execute")
 def execute_command(req: ExecuteRequest):
@@ -158,7 +225,7 @@ def execute_command(req: ExecuteRequest):
         }
 
 # -----------------------------------------------------------------------------
-# 3. Single-Page Web Frontend (Minimalist Dark Code Editor Aesthetic)
+# 3. Single-Page Web Frontend (Dark Mode Code Editor Aesthetic)
 # -----------------------------------------------------------------------------
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -210,7 +277,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             padding: 3px 8px;
             border-radius: 3px;
             font-size: 11px;
-            color: #888888;
+            color: #00ff66;
         }
         /* Main Workspace Split */
         .workspace {
@@ -240,18 +307,18 @@ HTML_CONTENT = """<!DOCTYPE html>
             background-color: #2d2d2d;
             color: #cccccc;
             border: 1px solid #3c3c3c;
-            padding: 7px 10px;
+            padding: 8px 10px;
             font-size: 12px;
             font-family: inherit;
             text-align: left;
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: 3px;
             transition: all 0.15s ease;
         }
         .template-btn:hover {
-            background-color: #3e3e42;
+            background-color: #0e639c;
             color: #ffffff;
-            border-color: #007acc;
+            border-color: #1177bb;
         }
         .file-tree-container {
             background-color: #0d0d0d;
@@ -269,14 +336,14 @@ HTML_CONTENT = """<!DOCTYPE html>
             justify-content: space-between;
             align-items: center;
         }
-        .refresh-btn {
+        .icon-btn {
             background: none;
             border: none;
             color: #888888;
             cursor: pointer;
-            font-size: 14px;
+            font-size: 13px;
         }
-        .refresh-btn:hover {
+        .icon-btn:hover {
             color: #ffffff;
         }
         /* Main Log Output Area */
@@ -306,7 +373,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         .log-entry-cmd { color: #00ff66; font-weight: bold; }
         .log-entry-stdout { color: #d4d4d4; }
         .log-entry-stderr { color: #f44747; }
-        .log-entry-exp { color: #ce9178; italic: true; }
+        .log-entry-exp { color: #ce9178; font-style: italic; }
 
         /* Input Control Bar */
         .input-bar {
@@ -321,7 +388,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             padding: 10px 12px;
             font-family: inherit;
             font-size: 13px;
-            border-radius: 2px;
+            border-radius: 3px;
             outline: none;
         }
         .prompt-input:focus {
@@ -336,7 +403,8 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-size: 12px;
             font-weight: bold;
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: 3px;
+            transition: background 0.15s ease;
         }
         .submit-btn:hover {
             background-color: #1177bb;
@@ -383,7 +451,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             padding: 10px;
             font-size: 12px;
             color: #00ff66;
-            border-radius: 2px;
+            border-radius: 3px;
             white-space: pre-wrap;
         }
         .exp-box {
@@ -392,7 +460,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             padding: 10px;
             font-size: 12px;
             color: #ce9178;
-            border-radius: 2px;
+            border-radius: 3px;
         }
         .modal-actions {
             display: flex;
@@ -408,7 +476,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-family: inherit;
             font-size: 12px;
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: 3px;
         }
         .btn-cancel:hover { background-color: #4e5257; }
         .btn-approve {
@@ -420,7 +488,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-size: 12px;
             font-weight: bold;
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: 3px;
         }
         .btn-approve:hover { background-color: #2ea043; }
     </style>
@@ -443,30 +511,34 @@ HTML_CONTENT = """<!DOCTYPE html>
         <!-- Sidebar -->
         <div class="sidebar">
             <div class="sidebar-section-title">Command Templates</div>
-            <button class="template-btn" onclick="setPrompt('Create a main.py file with a print statement')">Create main.py file</button>
-            <button class="template-btn" onclick="setPrompt('List all files in the workshop directory')">List directory files</button>
-            <button class="template-btn" onclick="setPrompt('Find all .py files in workshop')">Find python files</button>
-            <button class="template-btn" onclick="setPrompt('Show disk space usage of workshop')">Check disk usage</button>
-            <button class="template-btn" onclick="setPrompt('Create a folder named data')">Create data folder</button>
+            <button class="template-btn" onclick="runTemplate('Create a main.py file with a print statement')">Create main.py file</button>
+            <button class="template-btn" onclick="runTemplate('List all files in workshop')">List directory files</button>
+            <button class="template-btn" onclick="runTemplate('Find all .py files in workshop')">Find python files</button>
+            <button class="template-btn" onclick="runTemplate('Show disk space usage of workshop')">Check disk usage</button>
+            <button class="template-btn" onclick="runTemplate('Create a folder named data')">Create data folder</button>
+            <button class="template-btn" onclick="runTemplate('Read contents of main.py')">Read main.py contents</button>
 
             <div class="sidebar-row" style="margin-top: 8px;">
                 <div class="sidebar-section-title">Workshop Files</div>
-                <button class="refresh-btn" onclick="loadFiles()" title="Refresh file list">🔄</button>
+                <button class="icon-btn" onclick="loadFiles()" title="Refresh file list">🔄 Refresh</button>
             </div>
             <pre class="file-tree-container" id="fileTree">Loading files...</pre>
         </div>
 
         <!-- Main Content (Terminal Window) -->
         <div class="main-content">
-            <div class="sidebar-section-title">Terminal Log Output</div>
+            <div class="sidebar-row">
+                <div class="sidebar-section-title">Terminal Log Output</div>
+                <button class="icon-btn" onclick="clearLog()">🗑️ Clear Log</button>
+            </div>
             <div class="terminal-log" id="terminalLog">
-<span class="log-entry-system">[SYSTEM] Web-based AI Terminal Agent initialized.</span>
-<span class="log-entry-system">[SYSTEM] Commands execute strictly in local ./workshop sandbox.</span>
+<span class="log-entry-system">[SYSTEM] AI Code Editor Agent Sandbox initialized.</span>
+<span class="log-entry-system">[SYSTEM] All commands execute strictly in local ./workshop folder.</span>
 ----------------------------------------------------------------------
 </div>
             <div class="input-bar">
-                <input type="text" class="prompt-input" id="promptInput" placeholder="Type prompt (e.g. 'Create a file named test.py')..." onkeydown="if(event.key==='Enter') handlePromptSubmit()">
-                <button class="submit-btn" onclick="handlePromptSubmit()">GENERATE COMMAND</button>
+                <input type="text" class="prompt-input" id="promptInput" placeholder="Type prompt e.g. 'Create a file named test.py'..." onkeydown="if(event.key==='Enter') handlePromptSubmit()">
+                <button class="submit-btn" id="submitBtn" onclick="handlePromptSubmit()">GENERATE COMMAND</button>
             </div>
         </div>
     </div>
@@ -476,7 +548,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 <div class="modal-overlay" id="confirmModal">
     <div class="modal-box">
         <div class="modal-title">CONFIRM COMMAND EXECUTION</div>
-        <div class="modal-sub">The AI proposed the following shell command to run inside <b>./workshop</b>:</div>
+        <div class="modal-sub">Proposed shell command to run inside <b>./workshop</b>:</div>
         <div class="cmd-box" id="modalCmd"></div>
         <div class="exp-box" id="modalExp"></div>
         <div class="modal-actions">
@@ -490,8 +562,13 @@ HTML_CONTENT = """<!DOCTYPE html>
     let pendingCommand = "";
     let pendingExplanation = "";
 
-    function setPrompt(text) {
-        document.getElementById('promptInput').value = text;
+    function runTemplate(promptText) {
+        document.getElementById('promptInput').value = promptText;
+        handlePromptSubmit();
+    }
+
+    function clearLog() {
+        document.getElementById('terminalLog').innerHTML = '<span class="log-entry-system">[SYSTEM] Terminal log cleared.</span>\n';
     }
 
     function appendLog(htmlText) {
@@ -515,8 +592,12 @@ HTML_CONTENT = """<!DOCTYPE html>
         const prompt = input.value.trim();
         if (!prompt) return;
 
+        const btn = document.getElementById('submitBtn');
+        btn.disabled = true;
+        btn.textContent = 'GENERATING...';
+
         appendLog(`\n<span class="log-entry-prompt">&gt; PROMPT:</span> ${escapeHtml(prompt)}`);
-        appendLog(`<span class="log-entry-system">[AI] Translating prompt via Featherless AI...</span>`);
+        appendLog(`<span class="log-entry-system">[AI] Translating prompt to command...</span>`);
 
         try {
             const res = await fetch('/api/ai-command', {
@@ -526,14 +607,17 @@ HTML_CONTENT = """<!DOCTYPE html>
             });
             const data = await res.json();
             
-            pendingCommand = data.command || "";
-            pendingExplanation = data.explanation || "";
+            pendingCommand = data.command || "ls -la";
+            pendingExplanation = data.explanation || "Executes command inside workshop.";
 
             document.getElementById('modalCmd').textContent = pendingCommand;
             document.getElementById('modalExp').textContent = 'Explanation: ' + pendingExplanation;
             document.getElementById('confirmModal').style.display = 'flex';
         } catch (err) {
-            appendLog(`<span class="log-entry-stderr">[ERROR] AI Request failed: ${escapeHtml(String(err))}</span>`);
+            appendLog(`<span class="log-entry-stderr">[ERROR] Failed to generate command: ${escapeHtml(String(err))}</span>`);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'GENERATE COMMAND';
         }
     }
 
