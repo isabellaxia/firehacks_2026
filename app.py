@@ -352,8 +352,9 @@ def pm25_to_aqi(pm: float) -> float:
 # once per plan, index them in a coarse grid, and measure what fraction of each
 # route runs within GREEN_RADIUS of one.
 
-OVERPASS_HOSTS = ["https://overpass-api.de/api/interpreter",
-                  "https://overpass.kumi.systems/api/interpreter"]
+OVERPASS_HOSTS = ["https://overpass.kumi.systems/api/interpreter",
+                  "https://overpass-api.de/api/interpreter",
+                  "https://overpass.private.coffee/api/interpreter"]
 GREEN_RADIUS = 90.0          # metres; a park across the street still counts
 _green_cache: dict = {}
 
@@ -364,29 +365,57 @@ def fetch_green(lat: float, lon: float, radius_m: float) -> list:
     if key in _green_cache:
         return _green_cache[key]
     r = int(min(8000, max(1200, radius_m)))
-    q = f"""[out:json][timeout:8];
+    q = f"""[out:json][timeout:18];
 (
-  way["leisure"~"^(park|garden|nature_reserve|recreation_ground)$"](around:{r},{lat},{lon});
-  way["landuse"~"^(forest|grass|meadow|village_green)$"](around:{r},{lat},{lon});
-  way["natural"~"^(wood|water|scrub|grassland)$"](around:{r},{lat},{lon});
+  way["leisure"~"park|garden|nature_reserve|recreation_ground"](around:{r},{lat},{lon});
+  way["landuse"~"forest|grass|meadow|village_green|recreation"](around:{r},{lat},{lon});
+  way["natural"~"wood|water|scrub|grassland"](around:{r},{lat},{lon});
+  relation["leisure"="park"](around:{r},{lat},{lon});
 );
-out center 250;"""
+out center 300;"""
     pts = []
-    for host in OVERPASS_HOSTS[:1]:      # one host, one short attempt; never block the plan
+    for host in OVERPASS_HOSTS:
         try:
-            resp = requests.post(host, data={"data": q}, timeout=9,
-                                 headers={"User-Agent": "route-planner/1.0"})
+            resp = requests.get(host, params={"data": q}, timeout=20,
+                                headers={"User-Agent": "route-planner/1.0 (hackathon)"})
             if resp.status_code != 200:
                 continue
             for el in resp.json().get("elements", []):
                 c = el.get("center") or el
                 if c.get("lat") and c.get("lon"):
                     pts.append((c["lat"], c["lon"]))
-            break
+            if pts:
+                break
         except Exception:
             continue
     _green_cache[key] = pts
     return pts
+
+
+def green_hotspots(lat, lon, pts, k=3):
+    """Where the green actually is: the densest clusters, as bearing and distance.
+
+    Used to aim candidate loops at parks when the runner wants greenery, and away
+    from them when they do not.
+    """
+    if not pts:
+        return []
+    cells = {}
+    for pla, plo in pts:
+        key = (round(pla, 2), round(plo, 2))
+        cells.setdefault(key, []).append((pla, plo))
+    ranked = sorted(cells.items(), key=lambda kv: -len(kv[1]))[:k]
+    out = []
+    for _, group in ranked:
+        cla = sum(x[0] for x in group) / len(group)
+        clo = sum(x[1] for x in group) / len(group)
+        dy = (cla - lat) * 111320.0
+        dx = (clo - lon) * 111320.0 * math.cos(math.radians(lat))
+        dist = math.hypot(dx, dy)
+        bearing = (math.degrees(math.atan2(dx, dy)) + 360) % 360
+        out.append({"lat": cla, "lon": clo, "bearing": bearing,
+                    "distance_m": round(dist), "features": len(group)})
+    return out
 
 
 def _grid(pts, cell_deg=0.004):
@@ -452,7 +481,8 @@ def offset(lat: float, lon: float, bearing_deg: float, metres: float):
 
 
 def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
-                 emphasis: list[str] | None = None, n: int = 6) -> list[dict]:
+                 emphasis: list[str] | None = None, n: int = 6,
+                 hotspots: list | None = None, green_bias: float = 0.0) -> list[dict]:
     """Candidate loops that are actually different from one another.
 
     OpenRouteService's round_trip helper reseeded a few times tends to return the
@@ -482,8 +512,25 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     # Alternating the reach as well as the bearing pushes some loops further out,
     # where the streets, surfaces and greenery genuinely differ from the blocks
     # right around the start.
-    bearings = [(0, 1.0), (60, 0.75), (120, 1.15), (180, 1.0), (240, 0.75),
-                (300, 1.15)][:n]
+    spread = [(0, 1.0), (60, 0.75), (120, 1.15), (180, 1.0), (240, 0.75), (300, 1.15)]
+
+    # green_bias > 0 means the runner wants greenery: aim loops straight at the
+    # densest parks nearby. green_bias < 0 means they do not: aim away from them.
+    # Half the candidates follow the bias, half stay spread out, so there is always
+    # something to compare against.
+    bearings = []
+    if hotspots and abs(green_bias) > 0.15:
+        for h in hotspots[:3]:
+            b = h["bearing"] if green_bias > 0 else (h["bearing"] + 180) % 360
+            reach = max(0.55, min(1.35, (h["distance_m"] / max(1.0, r)))) \
+                if green_bias > 0 else 1.0
+            bearings.append((b, reach))
+            bearings.append(((b + 40) % 360, reach * 0.85))
+    for spec in spread:
+        if len(bearings) >= n:
+            break
+        bearings.append(spec)
+    bearings = bearings[:n]
 
     def one(spec):
         """One bearing and reach, one loop. Parallel, or the request times out."""
@@ -711,6 +758,29 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
     }
 
 
+def sample_points(coords: list, k: int) -> list:
+    """Evenly spaced points along the loop, always including the start and end."""
+    if len(coords) <= k:
+        return coords
+    step = (len(coords) - 1) / (k - 1)
+    return [coords[min(len(coords) - 1, round(i * step))] for i in range(k)]
+
+
+def graphhopper_url(coords: list, activity: str) -> str:
+    """Open the exact loop on GraphHopper Maps.
+
+    Google's directions URL caps at nine waypoints and re-routes between them, so a
+    loop comes back approximate. GraphHopper accepts many more points, which
+    reproduces the route as planned. Good for checking it on a laptop before you go.
+    """
+    if not coords:
+        return ""
+    prof = {"cycle": "bike", "hike": "hike"}.get(activity, "foot")
+    pts = sample_points(coords, 14)
+    q = "&".join(f"point={c[1]:.5f}%2C{c[0]:.5f}" for c in pts)
+    return f"https://graphhopper.com/maps/?{q}&profile={prof}&layer=OpenStreetMap"
+
+
 def google_maps_url(coords: list, activity: str) -> str:
     """A turn-by-turn link the user can open in Google Maps.
 
@@ -719,12 +789,10 @@ def google_maps_url(coords: list, activity: str) -> str:
     """
     if not coords or len(coords) < 2:
         return ""
-    pts = [(c[1], c[0]) for c in coords]          # GeoJSON is [lon, lat]
+    picked = sample_points(coords, 10)
+    pts = [(c[1], c[0]) for c in picked]          # GeoJSON is [lon, lat]
     start = pts[0]
-    body = pts[1:-1]
-    k = min(8, len(body))
-    step = max(1, len(body) // k) if k else 1
-    way = body[::step][:8]
+    way = pts[1:-1][:8]
     mode = {"cycle": "bicycling"}.get(activity, "walking")
     fmt = lambda p: f"{p[0]:.5f},{p[1]:.5f}"
     url = ("https://www.google.com/maps/dir/?api=1"
@@ -740,6 +808,8 @@ class PlanRequest(BaseModel):
     lat: float
     lon: float
     prompt: str = "I want to run 5 km."
+    # -1 aims the loops away from parks, +1 aims them straight at the nearest ones.
+    green_bias: float | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -851,13 +921,24 @@ def _plan(req: PlanRequest):
         air = f_air.result()
         weather = f_wx.result()
         try:
-            green_pts = f_gr.result(timeout=11)
+            green_pts = f_gr.result(timeout=22)
         except Exception:
             green_pts = []
 
+    hotspots = green_hotspots(req.lat, req.lon, green_pts)
+
+    # Where the greenery bias comes from: an explicit slider value if the client
+    # sent one, otherwise the preference the model read from the request text.
+    if req.green_bias is not None:
+        bias = max(-1.0, min(1.0, req.green_bias))
+    elif "green" in emphasis or "scenic" in emphasis:
+        bias = 1.0
+    else:
+        bias = 0.0
+
     try:
         raw = fetch_routes(req.lat, req.lon, parsed["target_m"], parsed["activity"],
-                           emphasis)
+                           emphasis, 6, hotspots, bias)
     except RuntimeError as e:
         return {"error": str(e)}
 
@@ -869,9 +950,9 @@ def _plan(req: PlanRequest):
         s = score_route(fc, parsed["target_m"], parsed["activity"], air, weather, i + 1,
                         weights, climb_ideal, green_pts)
         if s:
-            s["google_maps_url"] = google_maps_url(
-                s["geojson"].get("geometry", {}).get("coordinates", []),
-                parsed["activity"])
+            cs = s["geojson"].get("geometry", {}).get("coordinates", [])
+            s["google_maps_url"] = google_maps_url(cs, parsed["activity"])
+            s["graphhopper_url"] = graphhopper_url(cs, parsed["activity"])
             routes.append(s)
     if not routes:
         return {"error": "OpenRouteService returned no usable loops here. Try a different "
@@ -964,6 +1045,8 @@ def _plan(req: PlanRequest):
         "weather": weather,
         "daylight": daylight,
         "spread": spread,
+        "green_bias": bias,
+        "hotspots": hotspots,
         "uniform_by_design": uniform_by_design,
         "green_features": len(green_pts),
         "summary": summary,
@@ -1113,6 +1196,16 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
 .slfoot button{flex:1;background:transparent;border:1px solid var(--line);color:var(--chalk);
   border-radius:3px;padding:7px;font-size:11px;cursor:pointer}
 .slfoot button:hover{border-color:var(--blaze);color:#fff}
+.replan{width:100%;background:var(--blaze);color:#1A0B04;border:0;border-radius:3px;
+  padding:10px;margin-top:9px;font-family:var(--d);font-weight:700;font-size:13px;
+  letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
+.replan:disabled{opacity:.5;cursor:not-allowed}
+.navwrap{margin-top:10px}
+.nav2{display:block;text-align:center;background:transparent;border:1px solid var(--line);
+  color:var(--chalk);text-decoration:none;border-radius:3px;padding:7px;margin-top:6px;
+  font-size:11.5px}
+.nav2:hover{border-color:var(--chalk);color:#fff}
+.hotspot{font-size:10.5px;color:var(--chalk);margin:-6px 0 12px}
 .reorder{color:var(--blaze);font-size:11px;margin-top:8px;display:none}
 .reorder.on{display:block}
 .play{display:flex;gap:7px;margin-top:9px}
@@ -1365,15 +1458,19 @@ function renderCands() {
           <button data-fly="${i}">Fly the route</button>
           <button data-gpx="${i}">Download GPX</button></div>
         <div class="live" id="live"></div>
-        ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
-          target="_blank" rel="noopener">Navigate in Google Maps</a>` : ''}
+        <div class="navwrap">
+          ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
+            target="_blank" rel="noopener">Navigate this route</a>` : ''}
+          ${r.graphhopper_url ? `<a class="nav2" href="${esc(r.graphhopper_url)}"
+            target="_blank" rel="noopener">Open the exact loop on a full map</a>` : ''}
+        </div>
       </div>
     </button>`).join('');
 
   document.querySelectorAll('.cand').forEach(el =>
     el.addEventListener('click', e => {
-      if (e.target.closest('.nav') || e.target.closest('.gpx') || e.target.closest('[data-fly]'))
-        return;
+      if (e.target.closest('.nav') || e.target.closest('.nav2') ||
+          e.target.closest('.gpx') || e.target.closest('[data-fly]')) return;
       select(+el.dataset.i);
     }));
   document.querySelectorAll('[data-gpx]').forEach(b =>
@@ -1396,12 +1493,33 @@ function wireSliders() {
       box.querySelector(`[data-wv="${inp.dataset.w}"]`).textContent = inp.value;
       rescore();
     }));
+  const rp = document.getElementById('replan');
+  if (rp) rp.addEventListener('click', async () => {
+    const w = USER_W || DATA.weights.applied;
+    const base = DATA.weights.base.green ?? 0.1;
+    // above the default greenery weight means seek parks, below means avoid them
+    const bias = Math.max(-1, Math.min(1, ((w.green ?? base) - base) / 0.3));
+    rp.disabled = true;
+    rp.innerHTML = '<span class="spin"></span>Finding new routes';
+    try {
+      const res = await fetch('/api/plan-route', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({lat: parseFloat($('#lat').value),
+                              lon: parseFloat($('#lon').value),
+                              prompt: $('#prompt').value, green_bias: bias})});
+      const d = await res.json();
+      if (d.error) { alert(d.error); }
+      else { const keep = USER_W; render(d); USER_W = keep; wireSliders(); rescore(); }
+    } catch (e) { alert('Could not fetch new routes: ' + e.message); }
+    finally { rp.disabled = false; rp.textContent = 'Find new routes for these weights'; }
+  });
   box.querySelectorAll('[data-preset]').forEach(b =>
     b.addEventListener('click', () => {
       const p = b.dataset.preset;
       if (p === 'ai') USER_W = null;
       if (p === 'safe') USER_W = {...DATA.weights.applied, safety: .40, simplicity: .12};
-      if (p === 'clean') USER_W = {...DATA.weights.applied, air: .40, green: .16};
+      if (p === 'green') USER_W = {...DATA.weights.applied, green: .45, noise: .14};
+      if (p === 'nogreen') USER_W = {...DATA.weights.applied, green: .00, distance: .35};
       wireSliders();
       rescore();
     }));
@@ -1589,10 +1707,15 @@ function sliderPanel() {
       <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`;
     }).join('')}
     <div class="slfoot">
-      <button data-preset="ai">Back to AI weights</button>
+      <button data-preset="ai">Reset</button>
       <button data-preset="safe">Max safety</button>
-      <button data-preset="clean">Max clean air</button>
+      <button data-preset="green">Max greenery</button>
+      <button data-preset="nogreen">Avoid green</button>
     </div>
+    <button class="replan" id="replan">Find new routes for these weights</button>
+    <p style="font-size:10.5px;color:var(--dim);margin:7px 0 0;line-height:1.5">
+      Moving a slider re-ranks the loops you already have. This asks for
+      <em>new</em> loops aimed at, or away from, the nearest parks.</p>
     <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
   </div>`;
 }
@@ -1673,6 +1796,11 @@ function render(d) {
          <b>${d.daylight.dark_minutes} minutes</b> — take a light, or pick a shorter loop.</div>`
       : ''}
     <div class="summary"><div class="tagline">Recommendation</div>${esc(d.summary)}</div>
+    ${(d.hotspots && d.hotspots.length) ? `<div class="hotspot">Nearest green:
+      ${d.hotspots.slice(0,2).map(h =>
+        `${h.features} features ${Math.round(h.distance_m)} m away`).join(' · ')}
+      ${d.green_bias > 0.15 ? '— loops aimed toward it'
+        : d.green_bias < -0.15 ? '— loops aimed away from it' : ''}</div>` : ''}
     <div id="paintbar"></div>
     <div id="slidebox"></div>
     <label>Candidate loops &mdash; ${d.routes.length} different directions</label>
