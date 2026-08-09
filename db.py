@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS airports (
     notes     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS reports_fts
 USING fts5(narrative, content='reports', content_rowid='id', tokenize='porter');
 """

@@ -219,6 +219,103 @@ async def verify_finding(claim: str, report_ids: str = "") -> dict:
     return {"claim": claim, "checked_against": [r["report_id"] for r in rows], **parsed}
 
 
+_scan_cache: dict = {}
+
+
+async def scan_corpus(months: int = 24, recent_months: int = 6,
+                      max_p: float = 0.05, min_reports: int = 6) -> dict:
+    """Sweep every airport x cluster pair and rank what is rising. Pure Python.
+
+    Nobody tells it where to look. This is the standing watch.
+    """
+    key = (months, recent_months, max_p, min_reports)
+    if key in _scan_cache:
+        return _scan_cache[key]
+
+    con = db.connect()
+    end = _latest_ym(con)
+    labels = {r["cluster_id"]: r["label"] for r in con.execute("SELECT cluster_id, label FROM clusters")}
+    names = {r["icao"]: r["name"] for r in con.execute("SELECT icao, name FROM airports")}
+    pairs = con.execute(
+        "SELECT airport, cluster_id, COUNT(*) n FROM reports GROUP BY airport, cluster_id "
+        "HAVING n >= ?", [min_reports]).fetchall()
+
+    findings = []
+    for p in pairs:
+        t = _trend_core(con, p["cluster_id"], p["airport"], end, months, recent_months)
+        if t["p_value"] <= max_p and (t["rate_ratio"] or 0) > 1.0:
+            findings.append({
+                "airport": p["airport"], "airport_name": names.get(p["airport"], ""),
+                "cluster_id": p["cluster_id"], "label": labels.get(p["cluster_id"], ""),
+                "rate_ratio": t["rate_ratio"], "p_value": t["p_value"],
+                "recent_reports": t["recent_reports"],
+                "recent_rate_per_month": t["recent_rate_per_month"],
+                "baseline_rate_per_month": t["baseline_rate_per_month"],
+                "monthly_counts": t["monthly_counts"],
+            })
+    findings.sort(key=lambda f: (f["p_value"], -(f["rate_ratio"] or 0)))
+
+    out = {"scanned_pairs": len(pairs), "window": f"through {end}",
+           "flagged": len(findings), "findings": findings[:12],
+           "note": "Every pair tested in Python. No language model involved in this scan."}
+    _scan_cache[key] = out
+    return out
+
+
+async def lead_time(cluster_id: str, airport: str, incident_ym: str,
+                    months: int = 18, recent_months: int = 6) -> dict:
+    """Walk the cutoff backwards month by month: how early was this detectable?
+
+    Answers the only question that matters about a prediction system.
+    """
+    con = db.connect()
+    all_ym = [r["ym"] for r in con.execute("SELECT DISTINCT ym FROM reports ORDER BY ym")]
+    candidates = [y for y in all_ym if y < incident_ym][-24:]
+
+    trail, first_flag = [], None
+    for cutoff in candidates:
+        y, m = int(cutoff[:4]), int(cutoff[5:7])
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+        t = _trend_core(con, cluster_id, airport.upper(), f"{y:04d}-{m:02d}", months, recent_months)
+        total = sum(t["monthly_counts"].values())
+        # Guard against flagging on almost-empty early windows, where two reports in a
+        # quiet month produce a huge ratio that means nothing.
+        flagged = bool(t["p_value"] < 0.01 and (t["rate_ratio"] or 0) >= 1.8
+                       and t["recent_reports"] >= 5 and total >= 12)
+        trail.append({"cutoff_ym": cutoff, "rate_ratio": t["rate_ratio"],
+                      "p_value": t["p_value"], "flagged": flagged})
+        if flagged and first_flag is None:
+            first_flag = cutoff
+
+    months_early = None
+    if first_flag:
+        a = int(first_flag[:4]) * 12 + int(first_flag[5:7])
+        b = int(incident_ym[:4]) * 12 + int(incident_ym[5:7])
+        months_early = b - a
+
+    return {"cluster_id": cluster_id, "airport": airport.upper(),
+            "incident_ym": incident_ym, "first_flagged_ym": first_flag,
+            "months_of_warning": months_early, "trail": trail,
+            "note": "Each row uses only reports filed before that month. "
+                    "No information from after the cutoff is visible to the test."}
+
+
+async def get_cluster_detail(cluster_id: str, airport: str, limit: int = 6) -> dict:
+    """The actual narratives behind a flagged pattern, newest first."""
+    con = db.connect()
+    rows = con.execute(
+        "SELECT report_id, ym, aircraft, phase, substr(narrative,1,420) AS narrative "
+        "FROM reports WHERE cluster_id=? AND airport=? ORDER BY ym DESC LIMIT ?",
+        [cluster_id, airport.upper(), min(int(limit), 12)]).fetchall()
+    c = con.execute("SELECT label, keywords FROM clusters WHERE cluster_id=?",
+                    [cluster_id]).fetchone()
+    return {"cluster_id": cluster_id, "airport": airport.upper(),
+            "label": c["label"] if c else "", "keywords": c["keywords"] if c else "",
+            "reports": [dict(r) for r in rows]}
+
+
 async def backtest_asof(cluster_id: str, airport: str, cutoff_ym: str,
                         months: int = 18, recent_months: int = 6) -> dict:
     """Recompute the trend using ONLY data before cutoff_ym. This is the honesty check."""
@@ -238,6 +335,7 @@ async def backtest_asof(cluster_id: str, airport: str, cutoff_ym: str,
 REGISTRY = {f.__name__: f for f in [
     search_reports, cluster_incidents, compute_trend, compare_baseline,
     get_airport_context, extract_causal_chain, verify_finding, backtest_asof,
+    scan_corpus, lead_time, get_cluster_detail,
 ]}
 
 
@@ -278,6 +376,20 @@ TOOL_SCHEMAS = [
             "source narratives. Call this on your final finding before you answer.",
             {"claim": S("your one-sentence finding"),
              "report_ids": S("comma-separated ids that should support it")}, ["claim"]),
+    _schema("scan_corpus", "Sweep every airport and every failure mode at once and rank what is "
+            "rising. Use this when the question is open-ended, e.g. 'what is most concerning right "
+            "now' with no airport named.",
+            {"months": I("default 24"), "recent_months": I("default 6"),
+             "max_p": {"type": "number", "description": "significance cutoff, default 0.05"}}, []),
+    _schema("lead_time", "Walk the cutoff month backwards to find the earliest month this pattern "
+            "would have been flagged, and how many months of warning that gives before a known "
+            "incident.",
+            {"cluster_id": S("like C06"), "airport": S("ICAO"),
+             "incident_ym": S("YYYY-MM of the incident")}, ["cluster_id", "airport", "incident_ym"]),
+    _schema("get_cluster_detail", "Pull the actual narratives behind a flagged pattern at one "
+            "airport, newest first.",
+            {"cluster_id": S("like C06"), "airport": S("ICAO"), "limit": I("max 12")},
+            ["cluster_id", "airport"]),
     _schema("backtest_asof", "Recompute a trend using only data before a cutoff month, to test "
             "whether the pattern was detectable in advance.",
             {"cluster_id": S("like C03"), "airport": S("ICAO"),
