@@ -150,15 +150,30 @@ def _extra_fraction(extras: dict, name: str, weight_map: dict, total_m: float) -
     return 100.0 * (num / den) if den else None
 
 
-def s_green(extras: dict, osm_fraction: float | None = None) -> tuple[float, bool]:
-    """Greenery, measured rather than assumed.
+# How green a road type usually is to travel along. Paths and tracks run through
+# parks and woods; state roads do not. ORS returns waytypes for every route, so
+# this always discriminates — unlike the park lookup, which can come back empty
+# when Overpass throttles the request.
+WAYTYPE_GREEN = {0: .35, 1: .04, 2: .10, 3: .22, 4: .88, 5: .92, 6: .55,
+                 7: .48, 8: .70, 9: .40, 10: .10}
+# Unpaved usually means a park path or a trail rather than a street.
+SURFACE_GREEN = {1: .18, 2: .06, 3: .08, 4: .12, 5: .30, 6: .45, 7: .55, 8: .78,
+                 9: .62, 10: .85, 11: .40, 12: .88, 13: .90, 14: .92, 15: .95,
+                 16: .60, 17: .80, 18: .70, 20: .50}
 
-    Preference order: the fraction of the route actually running past parks, woods
-    and water from OpenStreetMap; then ORS's own green index if this deployment
-    ships one; then the brief's 85.0 baseline, flagged as estimated.
+
+def s_green(extras: dict, osm_fraction: float | None = None) -> tuple[float, bool]:
+    """Greenery, measured three ways, never assumed if anything real is available.
+
+    1. ORS's own green index, when this deployment ships one.
+    2. The share of the route on paths, tracks and unpaved surfaces — always
+       available, so this is the one that guarantees routes differ from each other.
+    3. The fraction running past OpenStreetMap parks and woods, blended in as a
+       bonus when the Overpass lookup succeeded.
+
+    The 85.0 baseline from the brief only appears if all three are unavailable,
+    and it is flagged as estimated so the interface can say so.
     """
-    if osm_fraction is not None:
-        return 100.0 * min(1.0, osm_fraction * 1.35), True
     block = (extras or {}).get("green")
     if block and block.get("values"):
         num = den = 0.0
@@ -167,7 +182,22 @@ def s_green(extras: dict, osm_fraction: float | None = None) -> tuple[float, boo
             num += (int(val) / 10.0) * span
             den += span
         if den:
-            return 100.0 * (num / den), True
+            base = num / den
+            if osm_fraction is not None:
+                base = 0.7 * base + 0.3 * min(1.0, osm_fraction * 1.4)
+            return 100.0 * base, True
+
+    wt = _extra_fraction(extras, "waytypes", WAYTYPE_GREEN, 0)
+    sf = _extra_fraction(extras, "surface", SURFACE_GREEN, 0)
+    parts = [x / 100.0 for x in (wt, sf) if x is not None]
+    if parts:
+        base = sum(parts) / len(parts)
+        if osm_fraction is not None:
+            base = 0.55 * base + 0.45 * min(1.0, osm_fraction * 1.4)
+        return 100.0 * min(1.0, base * 1.6), True
+
+    if osm_fraction is not None:
+        return 100.0 * min(1.0, osm_fraction * 1.35), True
     return 85.0, False
 
 
@@ -744,6 +774,25 @@ def criteria():
             {"key": "weather", "label": "Conditions",
              "source": "Open-Meteo feels-like temperature, rain, wind and UV"},
         ],
+    }
+
+
+@app.get("/api/diagnose")
+def diagnose(lat: float = 37.6624, lon: float = -121.8747, prompt: str = "5 km run"):
+    """Which data sources answered, and how far apart the candidates are on each
+    criterion. If a slider does nothing, its spread here will be near zero."""
+    r = _plan(PlanRequest(lat=lat, lon=lon, prompt=prompt))
+    if "error" in r:
+        return r
+    return {
+        "candidates": len(r["routes"]),
+        "spread_per_criterion": r.get("spread"),
+        "dead_sliders": [k for k, v in (r.get("spread") or {}).items() if v < 2],
+        "green_features_found": r.get("green_features"),
+        "air_source": r["air"]["source"],
+        "estimated_flags": r["routes"][0]["estimated"],
+        "extras_returned_by_ors": sorted((r["routes"][0].get("extras") or {}).keys()),
+        "warnings": r.get("warnings"),
     }
 
 
