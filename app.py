@@ -228,7 +228,7 @@ def execute_command(req: ExecuteRequest):
         return {"command": cmd, "stdout": "", "stderr": f"Error: {str(err)}", "returncode": 1}
 
 # -----------------------------------------------------------------------------
-# 4. Instant Interactive Web Frontend
+# 4. Instant Interactive Web Frontend (Zero JS Syntax Errors)
 # -----------------------------------------------------------------------------
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -493,11 +493,9 @@ HTML_CONTENT = """<!DOCTYPE html>
                     <span>Terminal Log Output</span>
                     <button class="action-btn-sm" onclick="clearLog()">🗑️ Clear Log</button>
                 </div>
-                <div class="terminal-log" id="terminalLog">
-<span class="log-system">[SYSTEM] Interactive Code Editor & Terminal initialized.</span>
+                <div class="terminal-log" id="terminalLog"><span class="log-system">[SYSTEM] Interactive Code Editor & Terminal initialized.</span>
 <span class="log-system">[SYSTEM] Click [▶️ RUN FILE] above or type commands below to execute live in ./workshop.</span>
---------------------------------------------------------------------------------------------------
-</div>
+--------------------------------------------------------------------------------------------------</div>
                 <div class="input-bar">
                     <input type="text" class="prompt-input" id="promptInput" placeholder="Type command (e.g. 'python3 main.py', 'ls -la', 'Create app.py')...">
                     <button class="submit-btn" id="submitBtn" onclick="submitInput()">RUN COMMAND</button>
@@ -518,7 +516,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     function appendLog(htmlText) {
         var log = document.getElementById('terminalLog');
         if (log) {
-            log.innerHTML += htmlText + '\n';
+            log.innerHTML += '\\n' + htmlText;
             log.scrollTop = log.scrollHeight;
         }
     }
@@ -526,7 +524,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     function clearLog() {
         var log = document.getElementById('terminalLog');
         if (log) {
-            log.innerHTML = '<span class="log-system">[SYSTEM] Terminal log cleared.</span>\n';
+            log.innerHTML = '<span class="log-system">[SYSTEM] Terminal log cleared.</span>';
         }
     }
 
@@ -677,7 +675,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     async function directExecuteCommand(cmd, label) {
-        appendLog('\n<span class="log-cmd">$ ' + escapeHtml(cmd) + '</span>');
+        appendLog('<span class="log-cmd">$ ' + escapeHtml(cmd) + '</span>');
         if (label) {
             appendLog('<span class="log-exp"># ' + escapeHtml(label) + '</span>');
         }
@@ -707,7 +705,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     async function runAiPrompt(promptText) {
-        appendLog('\n<span class="log-prompt">&gt; AI PROMPT: ' + escapeHtml(promptText) + '</span>');
+        appendLog('<span class="log-prompt">&gt; AI PROMPT: ' + escapeHtml(promptText) + '</span>');
         try {
             var res = await fetch('/api/ai-command', {
                 method: 'POST',
