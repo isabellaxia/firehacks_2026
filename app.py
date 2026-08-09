@@ -19,10 +19,14 @@ distance, elevation, air quality, every score — is computed here in Python fro
 responses. The model never produces a metric.
 """
 import concurrent.futures as cf
+import json
 import math
 import os
 import re
 from typing import Any
+
+import time
+from datetime import datetime, timezone
 
 import requests
 from fastapi import FastAPI
@@ -583,8 +587,47 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
         except Exception as e:
             return {"error": str(e)}
 
-    with cf.ThreadPoolExecutor(max_workers=14) as pool:
-        return list(pool.map(one, specs))
+    def aimed(spec):
+        """A loop deliberately pointed at green land.
+
+        round_trip cannot be steered, so the greenest option it offers is whatever
+        its seeds happen to find. When there is green nearby we also send explicit
+        triangles at it, sized from the target length so they still come back the
+        right distance: a triangle with two via-points 72 degrees apart has a
+        perimeter of roughly four times the radius once streets are accounted for.
+        """
+        bearing, scale = spec
+        rr = (target_m / 4.0) * scale
+        p1 = offset(lat, lon, bearing, rr)
+        p2 = offset(lat, lon, bearing + 72, rr)
+        body = {
+            "coordinates": [[lon, lat], [p1[1], p1[0]], [p2[1], p2[0]], [lon, lat]],
+            "elevation": True, "instructions": True,
+            "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
+        }
+        if avoid:
+            body["options"] = {"avoid_features": avoid}
+        try:
+            resp = requests.post(ORS_URL.format(profile=profile), json=body,
+                                 headers={"Authorization": ORS_KEY,
+                                          "Content-Type": "application/json"}, timeout=14)
+            if resp.status_code != 200:
+                return {"error": f"ORS {resp.status_code}"}
+            return resp.json()
+        except Exception as e:
+            return {"error": str(e)}
+
+    aims = []
+    if hotspots:
+        for h in hotspots[:3]:
+            b = h["bearing"]
+            aims += [(b, 1.0), ((b + 30) % 360, 0.95), ((b - 30) % 360, 1.05)]
+        aims = aims[:5]
+
+    with cf.ThreadPoolExecutor(max_workers=18) as pool:
+        rt = pool.map(one, specs)
+        am = pool.map(aimed, aims) if aims else []
+        return list(rt) + list(am)
 
 
 # ────────────────────────────────────────────────────────────── model calls
@@ -856,6 +899,37 @@ def google_maps_url(coords: list, activity: str) -> str:
             f"/@{mid[1]:.5f},{mid[0]:.5f},15z/data=!3m1!4b1!4m2!4m1{mode}")
 
 
+# ──────────────────────────────────────────────── shared, saved routes
+#
+# Everyone who opens the site sees the same saved list, which is what makes it a
+# shared board rather than a private one. Kept in memory with a file backup so a
+# restart does not wipe it; a real deployment would use a database.
+
+SAVED_PATH = os.environ.get("SAVED_PATH", "/tmp/greenroute_saved.json")
+_saved: list = []
+_saved_lock = __import__("threading").Lock()
+
+
+def _load_saved():
+    global _saved
+    try:
+        with open(SAVED_PATH, "r", encoding="utf-8") as f:
+            _saved = json.load(f)[:300]
+    except Exception:
+        _saved = []
+
+
+def _persist():
+    try:
+        with open(SAVED_PATH, "w", encoding="utf-8") as f:
+            json.dump(_saved[:300], f)
+    except Exception:
+        pass
+
+
+_load_saved()
+
+
 # ────────────────────────────────────────────────────────────── API
 
 class PlanRequest(BaseModel):
@@ -950,6 +1024,54 @@ def diagnose(lat: float = 37.6624, lon: float = -121.8747, prompt: str = "5 km r
     }
 
 
+@app.get("/api/saved")
+def list_saved():
+    """Every route anyone has saved. Public by design."""
+    return {"routes": [{k: v for k, v in r.items() if k != "geojson"} for r in _saved]}
+
+
+@app.get("/api/saved/{route_id}")
+def get_saved(route_id: str):
+    for r in _saved:
+        if r["id"] == route_id:
+            return r
+    return {"error": "No route with that id."}
+
+
+@app.post("/api/saved")
+def save_route(payload: dict):
+    p = payload or {}
+    if not p.get("geojson"):
+        return {"error": "Nothing to save."}
+    entry = {
+        "id": f"r{int(time.time() * 1000) % 10_000_000}{len(_saved)}",
+        "name": (p.get("name") or "Untitled loop")[:60],
+        "by": (p.get("by") or "anonymous")[:24],
+        "distance_mi": p.get("distance_mi"),
+        "minutes": p.get("minutes"),
+        "elevation_gain_m": p.get("elevation_gain_m"),
+        "green": p.get("green"),
+        "start": p.get("start"),
+        "google_maps_url": p.get("google_maps_url"),
+        "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "geojson": p["geojson"],
+    }
+    with _saved_lock:
+        _saved.insert(0, entry)
+        del _saved[300:]
+        _persist()
+    return {"ok": True, "id": entry["id"], "count": len(_saved)}
+
+
+@app.delete("/api/saved/{route_id}")
+def delete_saved(route_id: str):
+    with _saved_lock:
+        before = len(_saved)
+        _saved[:] = [r for r in _saved if r["id"] != route_id]
+        _persist()
+    return {"ok": True, "removed": before - len(_saved)}
+
+
 @app.post("/api/plan-route")
 def plan_route(req: PlanRequest):
     """Always returns JSON. A crash here used to surface as an HTML error page,
@@ -976,8 +1098,7 @@ def _plan(req: PlanRequest):
     # Only the green-bias path needs the park lookup, and that lookup is the slowest
     # thing here. Skip it unless it will actually be used, so an ordinary plan never
     # waits on Overpass. When it is needed, a cached result usually makes it instant.
-    need_green = (req.weights is not None
-                  or (req.green_bias is not None and abs(req.green_bias) > 0.15))
+    need_green = True      # the ladder needs to know where the green is
     with cf.ThreadPoolExecutor(max_workers=3) as pool:
         f_air = pool.submit(fetch_air, req.lat, req.lon)
         f_wx = pool.submit(fetch_weather, req.lat, req.lon)
@@ -1007,7 +1128,7 @@ def _plan(req: PlanRequest):
 
     try:
         raw = fetch_routes(req.lat, req.lon, parsed["target_m"], parsed["activity"],
-                           emphasis, 6, hotspots, bias)
+                           emphasis, 14, hotspots, bias)
     except RuntimeError as e:
         return {"error": str(e)}
 
@@ -1266,6 +1387,31 @@ summary{font-size:12.5px;color:var(--soft);cursor:pointer}
 .crit .tr i{display:block;height:100%;background:var(--leaf)}
 .crit .v{font-variant-numeric:tabular-nums;color:var(--ink);text-align:right}
 .crit input[type=range]{height:5px}
+nav.tabs{display:flex;border-bottom:1px solid var(--line)}
+nav.tabs button{flex:1;background:#fff;border:0;border-bottom:3px solid transparent;
+  padding:12px;font-family:var(--b);font-size:13px;font-weight:600;color:var(--soft);
+  cursor:pointer}
+nav.tabs button[aria-selected="true"]{color:var(--leaf-dk);border-bottom-color:var(--leaf);
+  background:var(--leaf-lt)}
+.pane{display:none}.pane.on{display:block}
+
+.mix{background:#fff;border:1px solid var(--line);border-radius:10px;padding:13px 15px;
+  margin-bottom:16px}
+.mix h4{font-family:var(--d);font-weight:700;font-size:14px;margin:0 0 2px}
+.mix p{font-size:11.5px;color:var(--soft);margin:0 0 11px;line-height:1.5}
+.mx{display:grid;grid-template-columns:74px 1fr;gap:9px;align-items:center;
+  font-size:12px;color:var(--soft);margin-bottom:7px}
+
+.card{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:9px;
+  cursor:pointer;background:#fff}
+.card:hover{border-color:var(--leaf)}
+.card.on{border-color:var(--leaf);background:var(--leaf-lt)}
+.card h4{font-family:var(--d);font-weight:700;font-size:15px;margin:0 0 3px}
+.card .meta{font-size:11.5px;color:var(--soft)}
+.card .rm{float:right;color:var(--stone);font-size:11px;text-decoration:underline}
+.saverow{display:grid;grid-template-columns:1fr auto;gap:7px;margin-bottom:7px}
+.saverow input{border:1px solid var(--line);border-radius:8px;padding:9px 10px;
+  font-family:var(--b);font-size:13px}
 .err{background:#FDECEA;border-left:3px solid #C0392B;color:#7A2318;padding:11px 13px;
   border-radius:0 8px 8px 0;font-size:13px;line-height:1.5}
 .empty{color:var(--stone);font-size:13px;line-height:1.6}
@@ -1286,16 +1432,30 @@ summary{font-size:12.5px;color:var(--soft);cursor:pointer}
       <div class="tag">Six loops, least green to most green</div>
     </div>
 
-    <div class="ask">
+    <nav class="tabs">
+      <button data-tab="plan" aria-selected="true">Plan</button>
+      <button data-tab="saved" aria-selected="false">Saved routes</button>
+    </nav>
+
+    <div class="ask pane on" id="ask">
       <textarea id="prompt" placeholder="I want to run 5 miles">I want to run 5 miles</textarea>
       <button class="go" id="go">Find routes</button>
       <p class="tiny"><a id="locate">use my location</a> &nbsp;·&nbsp; or click the map</p>
     </div>
 
-    <div class="body" id="out">
-      <p class="empty">Type how far you want to go, then choose a starting point on the
-      map. You will get six loops of that length, from the most built-up to the
-      leafiest, and a slider to move between them.</p>
+    <div class="body">
+      <div class="pane on" id="pane-plan">
+        <div id="out">
+          <p class="empty">Type how far you want to go, then choose a starting point on
+          the map. You will get six loops of that length, from the most built-up to the
+          leafiest, and a slider to move between them.</p>
+        </div>
+      </div>
+      <div class="pane" id="pane-saved">
+        <p class="empty" id="savedempty">Nothing saved yet. Plan a loop, then press Save
+        and it will appear here for everyone who opens this site.</p>
+        <div id="savedlist"></div>
+      </div>
     </div>
   </aside>
   <div id="map"></div>
@@ -1387,6 +1547,99 @@ async function plan() {
 
 function pick(i) { SEL = i; render(); }
 
+/* The extra sliders are not separate objectives. Each one is a different way of
+   asking for more or less green: quiet, clean air and safety live in the green,
+   smooth tarmac and simple navigation live on the streets. They all fold into one
+   number, and that number chooses which of the six loops you are looking at. */
+const MIX = [
+  {k: 'quiet',  label: 'Quiet',      w:  1.0, def: 50},
+  {k: 'air',    label: 'Clean air',  w:  0.9, def: 50},
+  {k: 'safety', label: 'Safety',     w:  0.8, def: 50},
+  {k: 'smooth', label: 'Smooth',     w: -0.9, def: 50},
+  {k: 'simple', label: 'Few turns',  w: -0.7, def: 50},
+];
+let MIXV = Object.fromEntries(MIX.map(x => [x.k, x.def]));
+
+function mixToRung() {
+  const n = DATA.routes.length;
+  let pull = 0, tot = 0;
+  for (const s of MIX) {
+    pull += ((MIXV[s.k] - 50) / 50) * s.w;
+    tot += Math.abs(s.w);
+  }
+  const t = Math.max(-1, Math.min(1, pull / (tot * 0.55)));   // -1 .. +1
+  return Math.max(0, Math.min(n - 1, Math.round(((t + 1) / 2) * (n - 1))));
+}
+
+document.querySelectorAll('nav.tabs button').forEach(b =>
+  b.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(x =>
+      x.setAttribute('aria-selected', x === b));
+    const t = b.dataset.tab;
+    document.getElementById('pane-plan').classList.toggle('on', t === 'plan');
+    document.getElementById('pane-saved').classList.toggle('on', t === 'saved');
+    document.getElementById('ask').style.display = t === 'plan' ? '' : 'none';
+    if (t === 'saved') loadSaved();
+  }));
+
+async function loadSaved() {
+  const box = document.getElementById('savedlist');
+  const empty = document.getElementById('savedempty');
+  try {
+    const d = await (await fetch('/api/saved')).json();
+    const rs = d.routes || [];
+    empty.style.display = rs.length ? 'none' : '';
+    box.innerHTML = rs.map(r => `
+      <div class="card" data-id="${esc(r.id)}">
+        <a class="rm" data-del="${esc(r.id)}">remove</a>
+        <h4>${esc(r.name)}</h4>
+        <div class="meta">${r.distance_mi} mi · ${r.minutes} min · greenery
+          ${Math.round(r.green ?? 0)}/100 · saved by ${esc(r.by)} · ${esc(r.saved_at)}</div>
+      </div>`).join('');
+    box.querySelectorAll('.card').forEach(c =>
+      c.addEventListener('click', async e => {
+        if (e.target.dataset.del) return;
+        const full = await (await fetch('/api/saved/' + c.dataset.id)).json();
+        if (full.geojson) showSaved(full);
+        box.querySelectorAll('.card').forEach(x => x.classList.toggle('on', x === c));
+      }));
+    box.querySelectorAll('[data-del]').forEach(a =>
+      a.addEventListener('click', async e => {
+        e.stopPropagation();
+        await fetch('/api/saved/' + a.dataset.del, {method: 'DELETE'});
+        loadSaved();
+      }));
+  } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+}
+
+function showSaved(r) {
+  layers.forEach(l => m.removeLayer(l));
+  layers = [];
+  const line = L.polyline(r.geojson.geometry.coordinates.map(c => [c[1], c[0]]),
+    {color: '#2E7D4F', weight: 6, opacity: 1, lineJoin: 'round'}).addTo(m);
+  layers.push(line);
+  m.fitBounds(line.getBounds(), {padding: [40, 40]});
+}
+
+async function saveCurrent() {
+  const r = DATA.routes[SEL];
+  const name = (document.getElementById('savename').value || '').trim()
+    || `${r.distance_mi} mi loop`;
+  const by = (document.getElementById('saveby').value || '').trim() || 'anonymous';
+  const btn = document.getElementById('savebtn');
+  btn.disabled = true;
+  btn.textContent = 'Saving';
+  try {
+    await fetch('/api/saved', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name, by, distance_mi: r.distance_mi,
+        minutes: r.estimated_minutes, elevation_gain_m: r.elevation_gain_m,
+        green: r.scores.green, google_maps_url: r.google_maps_url,
+        start: [LAT, LON], geojson: r.geojson})});
+    btn.textContent = 'Saved to the public board';
+  } catch (e) { btn.textContent = 'Could not save'; }
+  finally { setTimeout(() => { btn.disabled = false; btn.textContent = 'Save this route'; }, 1600); }
+}
+
 function combinedPull() {
   if (!USER_W || !DATA) return null;
   const base = DATA.weights.base;
@@ -1408,6 +1661,15 @@ function render() {
         <b>${Math.round(r.scores.green)}</b>/100</div>
     </div>
 
+    <div class="mix">
+      <h4>What matters to you</h4>
+      <p>Each of these is another way of asking for more green, or less. They all
+         feed the one slider above.</p>
+      ${MIX.map(x => `<div class="mx"><span>${x.label}</span>
+        <input type="range" min="0" max="100" value="${MIXV[x.k]}" data-mix="${x.k}">
+        </div>`).join('')}
+    </div>
+
     <div class="stats">
       <div class="stat"><b>${r.distance_mi}</b><span>miles</span></div>
       <div class="stat"><b>${r.estimated_minutes}</b><span>minutes</span></div>
@@ -1426,12 +1688,26 @@ function render() {
       target="_blank" rel="noopener">Open the exact loop</a>` : ''}
     <a class="nav ghost" id="gpx">Download GPX</a>
 
+    <div class="saverow" style="margin-top:14px">
+      <input id="savename" placeholder="Name this loop">
+      <input id="saveby" placeholder="You" style="width:88px">
+    </div>
+    <button class="go" id="savebtn">Save this route</button>
+    <p class="tiny">Saved routes appear on the public board for everyone.</p>
+
     <details>
       <summary>What went into this score</summary>
       <div id="crits"></div>
     </details>`;
 
   $('#dial').addEventListener('input', e => { SEL = +e.target.value; render(); });
+  document.querySelectorAll('[data-mix]').forEach(inp =>
+    inp.addEventListener('input', () => {
+      MIXV[inp.dataset.mix] = +inp.value;
+      SEL = mixToRung();
+      render();
+    }));
+  $('#savebtn').addEventListener('click', saveCurrent);
   document.querySelectorAll('.mini button').forEach(b =>
     b.addEventListener('click', () => pick(+b.dataset.i)));
   $('#gpx').addEventListener('click', () => toGPX(r));
