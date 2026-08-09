@@ -107,6 +107,53 @@ def apply_emphasis(weights: dict, emphasis: list[str]) -> dict:
     return {k: v / total for k, v in w.items()}
 
 
+# ── every slider expressed as a pull toward or away from green ───────────────
+#
+# The nine criteria are not independent in the real world. Parks are quiet, have
+# cleaner air, and keep you off roads; but their paths are unpaved, they wind, and
+# they are often on the hilly edge of town. So each criterion carries a signed
+# correlation with greenery, and moving ANY slider shifts where the route is aimed.
+#
+# Positive means "wanting more of this pulls the route toward green".
+# Negative means "wanting more of this pulls it toward streets".
+GREEN_CORRELATION = {
+    "green":      1.00,   # by definition
+    "noise":      0.80,   # parks are quiet; arterials are not
+    "air":        0.70,   # vegetation and distance from traffic both help
+    "safety":     0.60,   # footpaths and park trails beat road shoulders
+    "elevation":  0.25,   # green land is often the hilly, unbuilt edge of town
+    "surface":   -0.50,   # wanting smooth tarmac pulls you onto streets
+    "simplicity":-0.35,   # park paths wind; the grid is simpler to follow
+    "distance":  -0.15,   # hitting an exact distance is easier on a street grid
+    "weather":    0.00,   # measured at the start; unrelated to the route
+}
+
+GREEN_EXPLAIN = {
+    "green":      "aims the loops straight at the nearest green land",
+    "noise":      "pushes toward parks and away from traffic",
+    "air":        "pushes toward vegetation and away from busy roads",
+    "safety":     "prefers footpaths and park trails over road shoulders",
+    "elevation":  "leans toward the unbuilt, hillier edge of town",
+    "surface":    "pulls toward paved streets and away from gravel paths",
+    "simplicity": "pulls toward the street grid, which has fewer turns",
+    "distance":   "pulls toward streets, where hitting an exact length is easier",
+    "weather":    "measured at your start point, so it does not steer the route",
+}
+
+
+def bias_from_weights(weights: dict, base: dict) -> float:
+    """One number, -1 to +1: how hard the whole weight set pulls toward green.
+
+    Every slider feeds in. Raising quiet or safety pulls toward parks; raising
+    surface or flow pulls toward streets. This is what aims the candidate loops.
+    """
+    pull = 0.0
+    for k, corr in GREEN_CORRELATION.items():
+        delta = (weights.get(k, 0.0) - base.get(k, 0.0))
+        pull += delta * corr
+    return max(-1.0, min(1.0, pull * 4.0))
+
+
 # Preferred climb, metres per kilometre. A runner wants gentle rolling; a hiker
 # came for the hill; a cyclist on a road bike does not.
 IDEAL_CLIMB = {"run": 12.0, "walk": 8.0, "hike": 45.0, "cycle": 10.0}
@@ -367,12 +414,15 @@ def fetch_green(lat: float, lon: float, radius_m: float) -> list:
     r = int(min(8000, max(1200, radius_m)))
     q = f"""[out:json][timeout:13];
 (
-  way["leisure"~"park|garden|nature_reserve|recreation_ground"](around:{r},{lat},{lon});
-  way["landuse"~"forest|grass|meadow|village_green|recreation"](around:{r},{lat},{lon});
-  way["natural"~"wood|water|scrub|grassland"](around:{r},{lat},{lon});
-  relation["leisure"="park"](around:{r},{lat},{lon});
+  way["leisure"~"park|garden|nature_reserve|recreation_ground|golf_course|common|pitch"](around:{r},{lat},{lon});
+  way["landuse"~"forest|grass|meadow|village_green|recreation|allotments|orchard|vineyard|farmland|cemetery|greenfield"](around:{r},{lat},{lon});
+  way["natural"~"wood|water|scrub|grassland|heath|wetland|tree_row"](around:{r},{lat},{lon});
+  way["amenity"="grave_yard"](around:{r},{lat},{lon});
+  relation["leisure"~"park|nature_reserve"](around:{r},{lat},{lon});
+  relation["landuse"~"forest|grass|meadow"](around:{r},{lat},{lon});
+  relation["natural"~"wood|water"](around:{r},{lat},{lon});
 );
-out center 300;"""
+out center 400;"""
     pts = []
     for host in OVERPASS_HOSTS:
         try:
@@ -526,15 +576,26 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
         strength = min(1.0, abs(green_bias))
         n_seek = max(1, round(strength * (n - 1)))
         spreadf = 55 * (1.0 - strength) + 12      # tight aim at full strength
+        nearest = hotspots[0]["distance_m"]
+        # If the start already sits in or beside the green, "seek" means circling
+        # inside it, not striking out toward a distant cluster — and "avoid" means
+        # leaving. Getting this backwards is why a start next to a park could send
+        # every loop away from it.
+        inside = nearest < max(350.0, r * 0.35)
         for i in range(n_seek):
             h = hotspots[min(i // 2, len(hotspots) - 1)]
-            b = h["bearing"] if green_bias > 0 else (h["bearing"] + 180) % 360
-            b = (b + (spreadf if i % 2 else -spreadf) * (i // 2 + 1) * 0.5) % 360
-            if green_bias > 0:
-                # reach far enough to actually get there, but stay inside the budget
-                reach = max(0.5, min(1.4, h["distance_m"] / max(1.0, r)))
+            if inside and green_bias > 0:
+                # fan out around the green you are already in, short reach
+                b = (i * (360.0 / max(1, n_seek))) % 360
+                reach = 0.55 + 0.1 * (i % 2)
+            elif inside and green_bias < 0:
+                b = (h["bearing"] + 180 + (spreadf if i % 2 else -spreadf) * 0.4) % 360
+                reach = 1.25
             else:
-                reach = 1.0
+                b = h["bearing"] if green_bias > 0 else (h["bearing"] + 180) % 360
+                b = (b + (spreadf if i % 2 else -spreadf) * (i // 2 + 1) * 0.5) % 360
+                reach = max(0.5, min(1.4, h["distance_m"] / max(1.0, r))) \
+                    if green_bias > 0 else 1.0
             bearings.append((b, reach))
     for spec in spread:
         if len(bearings) >= n:
@@ -830,8 +891,11 @@ class PlanRequest(BaseModel):
     lat: float
     lon: float
     prompt: str = "I want to run 5 km."
-    # -1 aims the loops away from parks, +1 aims them straight at the nearest ones.
+    # -1 aims the loops away from green, +1 aims them straight at it.
     green_bias: float | None = None
+    # the client can send its whole weight set instead, and the server derives
+    # the bias from it using GREEN_CORRELATION
+    weights: dict | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -866,6 +930,8 @@ def criteria():
     """What the scorer measures and where each number comes from. Shown in the UI."""
     return {
         "weights": WEIGHTS,
+        "green_correlation": GREEN_CORRELATION,
+        "green_explain": GREEN_EXPLAIN,
         "criteria": [
             {"key": "distance", "label": "Distance match",
              "source": "OpenRouteService loop length vs your target"},
@@ -929,7 +995,8 @@ def _plan(req: PlanRequest):
     if not (-90 <= req.lat <= 90 and -180 <= req.lon <= 180):
         return {"error": "Those coordinates are not on Earth. Check latitude and longitude."}
 
-    parsed = parse_request(req.prompt, skip_model=req.green_bias is not None)
+    parsed = parse_request(req.prompt,
+                           skip_model=req.green_bias is not None or req.weights is not None)
     emphasis = parsed.get("emphasis") or []
     base_w = WEIGHTS.get(parsed["activity"], WEIGHTS["run"])
     weights = apply_emphasis(base_w, emphasis)
@@ -938,7 +1005,8 @@ def _plan(req: PlanRequest):
     # Only the green-bias path needs the park lookup, and that lookup is the slowest
     # thing here. Skip it unless it will actually be used, so an ordinary plan never
     # waits on Overpass. When it is needed, a cached result usually makes it instant.
-    need_green = req.green_bias is not None and abs(req.green_bias) > 0.15
+    need_green = (req.weights is not None
+                  or (req.green_bias is not None and abs(req.green_bias) > 0.15))
     with cf.ThreadPoolExecutor(max_workers=3) as pool:
         f_air = pool.submit(fetch_air, req.lat, req.lon)
         f_wx = pool.submit(fetch_weather, req.lat, req.lon)
@@ -957,7 +1025,9 @@ def _plan(req: PlanRequest):
 
     # Where the greenery bias comes from: an explicit slider value if the client
     # sent one, otherwise the preference the model read from the request text.
-    if req.green_bias is not None:
+    if req.weights:
+        bias = bias_from_weights(req.weights, base_w)
+    elif req.green_bias is not None:
         bias = max(-1.0, min(1.0, req.green_bias))
     elif "green" in emphasis or "scenic" in emphasis:
         bias = 1.0
@@ -1224,6 +1294,10 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
 .slfoot button{flex:1;background:transparent;border:1px solid var(--line);color:var(--chalk);
   border-radius:3px;padding:7px;font-size:11px;cursor:pointer}
 .slfoot button:hover{border-color:var(--blaze);color:#fff}
+.pullbar{background:#0F2721;border-radius:3px;padding:8px 10px;margin:2px 0 10px;
+  font-size:11px;color:var(--dim);line-height:1.5}
+.pullbar b{font-family:var(--m);font-weight:500}
+.pullbar .g{color:#5FBF8B}.pullbar .s{color:#E8B84B}
 .dial{border-top:1px solid var(--line);margin-top:12px;padding-top:11px}
 .replan{width:100%;background:var(--blaze);color:#1A0B04;border:0;border-radius:3px;
   padding:10px;margin-top:9px;font-family:var(--d);font-weight:700;font-size:13px;
@@ -1428,8 +1502,11 @@ fetch('/api/config').then(r => r.json()).then(c => {
   document.head.appendChild(sc);
 }).catch(() => startLeaflet('config unavailable'));
 
+let CORR = {}, EXPLAIN = {};
 fetch('/api/criteria').then(r => r.json()).then(c => {
   LABELS = Object.fromEntries(c.criteria.map(x => [x.key, x.label]));
+  CORR = c.green_correlation || {};
+  EXPLAIN = c.green_explain || {};
   $('#criteria').innerHTML = '<b style="color:var(--chalk)">What the score measures</b><br>' +
     c.criteria.map(x => `${esc(x.label)} — ${esc(x.source)}`).join('<br>');
 }).catch(()=>{});
@@ -1515,18 +1592,24 @@ function wireSliders() {
   const box = document.getElementById('slidebox');
   if (!box || !DATA) return;
   box.innerHTML = sliderPanel();
-  box.querySelectorAll('[data-w]').forEach(inp =>
+  box.querySelectorAll('[data-w]').forEach(inp => {
     inp.addEventListener('input', () => {
       USER_W = USER_W || {...DATA.weights.applied};
       USER_W[inp.dataset.w] = +inp.value / 100;
       box.querySelector(`[data-wv="${inp.dataset.w}"]`).textContent = inp.value;
+      showPull();
       rescore();
-    }));
+    });
+    // re-plan on release rather than on every pixel of the drag
+    inp.addEventListener('change', () => scheduleReplan());
+  });
+  showPull();
   const dial = document.getElementById('greendial');
   if (dial) dial.value = Math.round((DATA.green_bias ?? 0) * 100);
   const rp = document.getElementById('replan');
   if (rp) rp.addEventListener('click', async () => {
     const bias = (+((dial && dial.value) || 0)) / 100;
+    if (dial) USER_W = null;
     rp.disabled = true;
     rp.innerHTML = '<span class="spin"></span>Finding new routes';
     try {
@@ -1725,13 +1808,17 @@ function sliderPanel() {
   const w = USER_W || DATA.weights.applied;
   return `<div class="sliders">
     <h4>Tune it yourself</h4>
-    <p>These are the weights behind the ranking. Move one and everything re-ranks
-       instantly — no request, no waiting. A criterion marked <em>tied</em> scores the
-       same on every candidate, so moving it honestly cannot change anything.</p>
+    <p>Every criterion pulls the route toward green land or toward the street grid.
+       Quiet, clean air and safety live in parks; smooth tarmac and simple navigation
+       live on streets. Move any slider and the loops are re-planned to match.</p>
+    <div id="pulls" class="pullbar"></div>
     ${Object.keys(w).map(k => {
       const sp = (DATA.spread || {})[k] ?? 99;
       const byDesign = (DATA.uniform_by_design || []).includes(k);
       const dead = sp < 0.5 && !byDesign;
+      const corr = CORR[k] ?? 0;
+      const pull = corr > 0.15 ? '<span style="color:#5FBF8B">&#8593; green</span>'
+                 : corr < -0.15 ? '<span style="color:#E8B84B">&#8595; streets</span>' : '';
       const note = byDesign
         ? ' <span style="font-size:9px">(same for all)</span>'
         : dead ? ' <span style="font-size:9px">(tied)</span>' : '';
@@ -1740,7 +1827,8 @@ function sliderPanel() {
         : dead
         ? 'Every candidate scores the same here, so this slider cannot change the ranking'
         : 'Candidates differ by ' + sp + ' points on this criterion'}">
-      <span style="${dead ? 'opacity:.45' : ''}">${esc(LABELS[k] || k)}${note}</span>
+      <span style="${dead ? 'opacity:.45' : ''}" title="${esc(EXPLAIN[k] || '')}">${
+        esc(LABELS[k] || k)}${note} ${pull}</span>
       <input type="range" min="0" max="40" value="${Math.round(w[k] * 100)}"
         data-w="${k}" ${dead ? 'style="opacity:.4"' : ''}>
       <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`;
@@ -1766,6 +1854,59 @@ function sliderPanel() {
     </div>
     <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
   </div>`;
+}
+
+function combinedPull() {
+  const w = USER_W || (DATA && DATA.weights.applied) || {};
+  const base = (DATA && DATA.weights.base) || {};
+  let pull = 0;
+  for (const k in CORR) pull += ((w[k] ?? 0) - (base[k] ?? 0)) * CORR[k];
+  return Math.max(-1, Math.min(1, pull * 4));
+}
+
+function showPull() {
+  const el = document.getElementById('pulls');
+  if (!el) return;
+  const p = combinedPull();
+  const dir = p > 0.12 ? '<span class="g">toward green land</span>'
+            : p < -0.12 ? '<span class="s">toward the street grid</span>'
+            : 'balanced';
+  el.innerHTML = `Combined pull: <b>${p >= 0 ? '+' : ''}${p.toFixed(2)}</b> — ${dir}.
+    ${Math.abs(p) > 0.12 ? 'New loops are being planned to match.' : ''}`;
+  const dl = document.getElementById('greendial');
+  if (dl) dl.value = Math.round(p * 100);
+}
+
+let REPLAN_TIMER = null;
+function scheduleReplan() {
+  clearTimeout(REPLAN_TIMER);
+  REPLAN_TIMER = setTimeout(() => doReplan(combinedPull()), 500);
+}
+
+async function doReplan(bias) {
+  const rp = document.getElementById('replan');
+  if (rp) { rp.disabled = true; rp.innerHTML = '<span class="spin"></span>Re-planning'; }
+  try {
+    const res = await fetch('/api/plan-route', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lat: parseFloat($('#lat').value),
+                            lon: parseFloat($('#lon').value),
+                            prompt: $('#prompt').value,
+                            weights: USER_W || undefined,
+                            green_bias: USER_W ? undefined : bias})});
+    const d = await res.json();
+    if (!d.error) {
+      const keep = USER_W;
+      render(d);
+      USER_W = keep;
+      wireSliders();
+      rescore();
+    }
+  } catch (e) { /* keep the current routes rather than blanking the page */ }
+  finally {
+    const b = document.getElementById('replan');
+    if (b) { b.disabled = false; b.textContent = 'Find new routes at this setting'; }
+  }
 }
 
 function rescore() {
