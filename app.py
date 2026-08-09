@@ -149,30 +149,51 @@ def _extra_fraction(extras: dict, name: str, weight_map: dict, total_m: float) -
     return 100.0 * (num / den) if den else None
 
 
-def s_green(extras: dict) -> tuple[float, bool]:
-    """ORS 'green' index: 0 (no vegetation) to 10 (dense). Real, not a constant."""
+def s_green(extras: dict, osm_fraction: float | None = None) -> tuple[float, bool]:
+    """Greenery, measured rather than assumed.
+
+    Preference order: the fraction of the route actually running past parks, woods
+    and water from OpenStreetMap; then ORS's own green index if this deployment
+    ships one; then the brief's 85.0 baseline, flagged as estimated.
+    """
+    if osm_fraction is not None:
+        return 100.0 * min(1.0, osm_fraction * 1.35), True
     block = (extras or {}).get("green")
-    if not block or not block.get("values"):
-        return 85.0, False          # brief's baseline, flagged as estimated
-    num = den = 0.0
-    for a, b, val in block["values"]:
-        span = max(1, b - a)
-        num += (int(val) / 10.0) * span
-        den += span
-    return 100.0 * (num / den), True
+    if block and block.get("values"):
+        num = den = 0.0
+        for a, b, val in block["values"]:
+            span = max(1, b - a)
+            num += (int(val) / 10.0) * span
+            den += span
+        if den:
+            return 100.0 * (num / den), True
+    return 85.0, False
+
+
+# How loud each road class is to walk beside. Traffic volume is the dominant
+# source of ambient noise, and road class is the best free proxy for it.
+WAYTYPE_QUIET = {0: .55, 1: .10, 2: .28, 3: .48, 4: .92, 5: .88, 6: .82,
+                 7: .78, 8: .85, 9: .60, 10: .20}
 
 
 def s_noise(extras: dict) -> tuple[float, bool]:
-    """ORS 'noise' index: 0 quiet to 10 loud. Inverted."""
+    """Quiet score. Uses ORS's noise index when present, road class otherwise.
+
+    ORS only ships the noise index on some deployments, and falling back to a
+    constant made every route score identically — which is why the slider did
+    nothing. Road class is always returned, so this always discriminates.
+    """
     block = (extras or {}).get("noise")
-    if not block or not block.get("values"):
-        return 70.0, False
-    num = den = 0.0
-    for a, b, val in block["values"]:
-        span = max(1, b - a)
-        num += (1.0 - int(val) / 10.0) * span
-        den += span
-    return 100.0 * (num / den), True
+    if block and block.get("values"):
+        num = den = 0.0
+        for a, b, val in block["values"]:
+            span = max(1, b - a)
+            num += (1.0 - int(val) / 10.0) * span
+            den += span
+        if den:
+            return 100.0 * (num / den), True
+    v = _extra_fraction(extras, "waytypes", WAYTYPE_QUIET, 0)
+    return (v, True) if v is not None else (70.0, False)
 
 
 def s_safety(extras: dict, steps: int, km: float) -> tuple[float, bool]:
@@ -276,6 +297,85 @@ def pm25_to_aqi(pm: float) -> float:
         if pm <= hi:
             return alo + (ahi - alo) * (pm - lo) / (hi - lo)
     return 500.0
+
+
+# ── real greenery, measured from OpenStreetMap ───────────────────────────────
+# ORS only returns its green/noise indices on some deployments. Relying on them
+# meant every route scored the same constant, so the greenery slider did nothing.
+# Instead we pull the actual parks, woods and water near the start from Overpass
+# once per plan, index them in a coarse grid, and measure what fraction of each
+# route runs within GREEN_RADIUS of one.
+
+OVERPASS_HOSTS = ["https://overpass-api.de/api/interpreter",
+                  "https://overpass.kumi.systems/api/interpreter"]
+GREEN_RADIUS = 90.0          # metres; a park across the street still counts
+_green_cache: dict = {}
+
+
+def fetch_green(lat: float, lon: float, radius_m: float) -> list:
+    """Centres of parks, woods, grass, water and tree rows near the start."""
+    key = (round(lat, 3), round(lon, 3), round(radius_m / 500))
+    if key in _green_cache:
+        return _green_cache[key]
+    r = int(min(8000, max(1200, radius_m)))
+    q = f"""[out:json][timeout:25];
+(
+  way["leisure"~"^(park|garden|nature_reserve|recreation_ground|pitch)$"](around:{r},{lat},{lon});
+  way["landuse"~"^(forest|grass|meadow|village_green|greenfield|orchard)$"](around:{r},{lat},{lon});
+  way["natural"~"^(wood|scrub|grassland|water|heath)$"](around:{r},{lat},{lon});
+  way["leisure"="nature_reserve"](around:{r},{lat},{lon});
+);
+out center 400;"""
+    pts = []
+    for host in OVERPASS_HOSTS:
+        try:
+            resp = requests.post(host, data={"data": q}, timeout=25,
+                                 headers={"User-Agent": "route-planner/1.0"})
+            if resp.status_code != 200:
+                continue
+            for el in resp.json().get("elements", []):
+                c = el.get("center") or el
+                if c.get("lat") and c.get("lon"):
+                    pts.append((c["lat"], c["lon"]))
+            break
+        except Exception:
+            continue
+    _green_cache[key] = pts
+    return pts
+
+
+def _grid(pts, cell_deg=0.004):
+    g = {}
+    for la, lo in pts:
+        g.setdefault((int(la / cell_deg), int(lo / cell_deg)), []).append((la, lo))
+    return g, cell_deg
+
+
+def green_fraction(coords: list, green_pts: list) -> float | None:
+    """Fraction of the route running close to a green feature. 0..1, or None."""
+    if not green_pts or not coords:
+        return None
+    grid, cell = _grid(green_pts)
+    sample = coords[::max(1, len(coords) // 160)]
+    near = 0
+    for c in sample:
+        lo, la = c[0], c[1]
+        gi, gj = int(la / cell), int(lo / cell)
+        hit = False
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for (pla, plo) in grid.get((gi + di, gj + dj), ()):
+                    dy = (pla - la) * 111320.0
+                    dx = (plo - lo) * 111320.0 * math.cos(math.radians(la))
+                    if dy * dy + dx * dx <= GREEN_RADIUS * GREEN_RADIUS * 4:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        near += 1 if hit else 0
+    return near / len(sample)
 
 
 def fetch_weather(lat: float, lon: float) -> dict:
@@ -495,7 +595,7 @@ def write_summary(best: dict, ctx: dict) -> str:
 
 def score_route(feature_collection: dict, target_m: float, activity: str,
                 air: dict, weather: dict, idx: int, weights: dict | None = None,
-                climb_ideal: float | None = None, start=None) -> dict | None:
+                climb_ideal: float | None = None, green_pts: list | None = None) -> dict | None:
     feats = feature_collection.get("features") or []
     if not feats:
         return None
@@ -512,7 +612,7 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
 
     coords = f.get("geometry", {}).get("coordinates", [])
     eles = [c[2] for c in coords if len(c) > 2]
-    green, green_real = s_green(extras)
+    green, green_real = s_green(extras, green_fraction(coords, green_pts or []))
     noise, noise_real = s_noise(extras)
     safety, safety_real = s_safety(extras, steps, km)
     surface, surface_real = s_surface(extras)
@@ -656,6 +756,7 @@ def plan_route(req: PlanRequest):
 
     air = fetch_air(req.lat, req.lon)
     weather = fetch_weather(req.lat, req.lon)
+    green_pts = fetch_green(req.lat, req.lon, parsed["target_m"] * 0.8)
 
     try:
         raw = fetch_routes(req.lat, req.lon, parsed["target_m"], parsed["activity"],
@@ -669,7 +770,7 @@ def plan_route(req: PlanRequest):
             errors.append(fc["error"])
             continue
         s = score_route(fc, parsed["target_m"], parsed["activity"], air, weather, i + 1,
-                        weights, climb_ideal)
+                        weights, climb_ideal, green_pts)
         if s:
             s["google_maps_url"] = google_maps_url(
                 s["geojson"].get("geometry", {}).get("coordinates", []),
@@ -679,6 +780,14 @@ def plan_route(req: PlanRequest):
         return {"error": "OpenRouteService returned no usable loops here. Try a different "
                          "starting point or a shorter distance.",
                 "detail": errors[:2]}
+
+    # A slider can only change the outcome for a criterion whose scores differ
+    # between routes. Surface that plainly instead of letting a knob do nothing.
+    spread = {}
+    if len(routes) > 1:
+        for k in routes[0]["scores"]:
+            vals = [r["scores"][k] for r in routes]
+            spread[k] = round(max(vals) - min(vals), 1)
 
     routes.sort(key=lambda r: -r["score"])
     for rank, r in enumerate(routes, 1):
@@ -735,6 +844,8 @@ def plan_route(req: PlanRequest):
         "air": air,
         "weather": weather,
         "daylight": daylight,
+        "spread": spread,
+        "green_features": len(green_pts),
         "summary": summary,
         "routes": routes,
         "warnings": errors[:2],
@@ -1338,12 +1449,20 @@ function sliderPanel() {
   return `<div class="sliders">
     <h4>Tune it yourself</h4>
     <p>These are the weights behind the ranking. Move one and everything re-ranks
-       instantly — no request, no waiting.</p>
-    ${Object.keys(w).map(k => `<div class="sl">
-      <span>${esc(LABELS[k] || k)}</span>
+       instantly — no request, no waiting. A criterion marked <em>tied</em> scores the
+       same on every candidate, so moving it honestly cannot change anything.</p>
+    ${Object.keys(w).map(k => {
+      const sp = (DATA.spread || {})[k] ?? 99;
+      const dead = sp < 2;
+      return `<div class="sl" title="${dead
+        ? 'Every candidate scores the same here, so this slider cannot change the ranking'
+        : 'Candidates differ by ' + sp + ' points on this criterion'}">
+      <span style="${dead ? 'opacity:.45' : ''}">${esc(LABELS[k] || k)}${
+        dead ? ' <span style="font-size:9px">(tied)</span>' : ''}</span>
       <input type="range" min="0" max="40" value="${Math.round(w[k] * 100)}"
-        data-w="${k}">
-      <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`).join('')}
+        data-w="${k}" ${dead ? 'style="opacity:.4"' : ''}>
+      <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`;
+    }).join('')}
     <div class="slfoot">
       <button data-preset="ai">Back to AI weights</button>
       <button data-preset="safe">Max safety</button>
@@ -1430,7 +1549,8 @@ function render(d) {
     <div id="slidebox"></div>
     <label>Candidate loops &mdash; ${d.routes.length} different directions</label>
     <div id="cands"></div>
-    <p class="note">Air data: ${esc(a.source||'—')}. Distance parsed by ${esc(d.request.parsed_by)}.
+    <p class="note">Air data: ${esc(a.source||'—')}. Greenery measured against
+      ${d.green_features || 0} parks, woods and water features from OpenStreetMap. Distance parsed by ${esc(d.request.parsed_by)}.
       Scores are computed in Python from routing, elevation, air and weather data —
       the model reads your request and writes the summary, and never produces a number.
       An arrow marks a criterion you asked me to prioritise, which was weighted up before
