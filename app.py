@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FEATHERLESS_KEY = os.environ.get("FEATHERLESS_API_KEY", "")
 ORS_KEY = os.environ.get("ORS_API_KEY", "")
 OPENAQ_KEY = os.environ.get("OPENAQ_API_KEY", "")
+GOOGLE_MAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
 
 PARSE_MODEL = os.environ.get("PARSE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 WRITE_MODEL = os.environ.get("WRITE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
@@ -478,6 +479,8 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
     steps = sum(len(seg.get("steps", [])) for seg in props.get("segments", []))
     extras = props.get("extras", {})
 
+    coords = f.get("geometry", {}).get("coordinates", [])
+    eles = [c[2] for c in coords if len(c) > 2]
     green, green_real = s_green(extras)
     noise, noise_real = s_noise(extras)
     safety, safety_real = s_safety(extras, steps, km)
@@ -513,6 +516,11 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
         "weights": w,
         "estimated": {"green": not green_real, "noise": not noise_real,
                       "safety": not safety_real, "surface": not surface_real},
+        "extras": {k: v.get("values", []) for k, v in (extras or {}).items()},
+        "elevation": {"points": [round(e, 1) for e in eles[::max(1, len(eles)//120)]],
+                      "min": round(min(eles), 1) if eles else None,
+                      "max": round(max(eles), 1) if eles else None,
+                      "descent": round(float(props.get("descent") or 0))},
         "geojson": f,
     }
 
@@ -556,7 +564,8 @@ def index():
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     out = {"featherless_key": bool(FEATHERLESS_KEY), "ors_key": bool(ORS_KEY),
-           "openaq_key": bool(OPENAQ_KEY), "models": {}}
+           "openaq_key": bool(OPENAQ_KEY), "google_maps_key": bool(GOOGLE_MAPS_KEY),
+           "map_engine": "google" if GOOGLE_MAPS_KEY else "leaflet", "models": {}}
     if FEATHERLESS_KEY:
         try:
             ids = {m.id for m in ai.models.list().data}
@@ -565,6 +574,13 @@ def health() -> dict[str, Any]:
         except Exception as e:
             out["models"] = {"error": str(e)[:200]}
     return out
+
+
+@app.get("/api/config")
+def config():
+    """What the frontend needs to decide which map engine to load."""
+    return {"google_maps_key": GOOGLE_MAPS_KEY,
+            "map_engine": "google" if GOOGLE_MAPS_KEY else "leaflet"}
 
 
 @app.get("/api/criteria")
@@ -646,6 +662,24 @@ def plan_route(req: PlanRequest):
         unique.append(r)
     routes = unique[:4]
 
+    # Will they still be out after dark? Real times, computed here.
+    daylight = None
+    sunset = (weather or {}).get("sunset")
+    if sunset:
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+            ss = _dt.fromisoformat(sunset)
+            now = _dt.now(ss.tzinfo) if ss.tzinfo else _dt.now()
+            mins_left = (ss - now).total_seconds() / 60.0
+            need = routes[0]["estimated_minutes"]
+            daylight = {"sunset": ss.strftime("%-I:%M %p"),
+                        "minutes_of_light": round(mins_left),
+                        "minutes_needed": need,
+                        "finishes_in_dark": mins_left < need,
+                        "dark_minutes": max(0, round(need - mins_left))}
+        except Exception:
+            daylight = None
+
     ctx = {**parsed, "air": air, "weather": weather}
     summary = write_summary(routes[0], ctx)
 
@@ -660,6 +694,7 @@ def plan_route(req: PlanRequest):
                     "changed": sorted({k for e in emphasis for k in EMPHASIS.get(e, {})})},
         "air": air,
         "weather": weather,
+        "daylight": daylight,
         "summary": summary,
         "routes": routes,
         "warnings": errors[:2],
@@ -674,8 +709,6 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Route Planner — exercise routes scored on nine criteria</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -770,6 +803,53 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
   font-family:var(--d);font-weight:600;font-size:13px;letter-spacing:.1em;
   text-transform:uppercase}
 .nav:hover{background:var(--blaze);color:#1A0B04}
+.paint{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px}
+.paint button{background:#0F2721;border:1px solid var(--line);color:var(--dim);
+  border-radius:20px;padding:5px 11px;font-size:11px;cursor:pointer}
+.paint button[aria-pressed="true"]{border-color:var(--blaze);color:#FFD9C6;background:#2A5348}
+.legend{display:flex;gap:12px;font-size:10px;color:var(--dim);margin:-6px 0 12px;
+  align-items:center;flex-wrap:wrap}
+.legend i{display:inline-block;width:22px;height:6px;border-radius:2px;margin-right:4px;
+  vertical-align:middle}
+.elev{margin-top:9px;background:#0F2721;border-radius:3px;padding:7px 8px 4px}
+.elev svg{display:block;width:100%;height:52px}
+.elev .cap{display:flex;justify-content:space-between;font-size:9.5px;color:var(--dim);
+  margin-top:2px}
+.dark{background:#4A3A18;color:#F5E3B8;border-left:3px solid var(--warn);padding:10px 13px;
+  font-size:12.5px;line-height:1.5;margin-bottom:14px}
+.dark b{color:#FFF3D6}
+.gpx{display:block;text-align:center;background:transparent;border:1px solid var(--line);
+  color:var(--chalk);border-radius:3px;padding:8px;margin-top:7px;font-size:12px;
+  cursor:pointer;width:100%}
+.gpx:hover{border-color:var(--chalk);color:#fff}
+.radar{background:#0F2721;border-radius:3px;padding:8px;margin-top:10px}
+.radar svg{display:block;width:100%;height:190px}
+.sliders{background:#1D3B34;border:1px solid var(--line);border-radius:3px;padding:13px 14px;
+  margin-bottom:14px}
+.sliders h4{font-family:var(--d);font-weight:700;font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;margin:0 0 3px;color:var(--blaze)}
+.sliders p{font-size:11px;color:var(--dim);margin:0 0 11px;line-height:1.5}
+.sl{display:grid;grid-template-columns:82px 1fr 30px;gap:8px;align-items:center;
+  font-size:11px;color:var(--dim);margin-bottom:5px}
+.sl input{-webkit-appearance:none;appearance:none;height:4px;background:#0F2721;
+  border:0;border-radius:2px;padding:0}
+.sl input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;
+  border-radius:50%;background:var(--blaze);cursor:pointer}
+.sl input::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;
+  background:var(--blaze);cursor:pointer}
+.sl b{font-family:var(--m);color:var(--ink);font-weight:500;text-align:right}
+.slfoot{display:flex;gap:7px;margin-top:10px}
+.slfoot button{flex:1;background:transparent;border:1px solid var(--line);color:var(--chalk);
+  border-radius:3px;padding:7px;font-size:11px;cursor:pointer}
+.slfoot button:hover{border-color:var(--blaze);color:#fff}
+.reorder{color:var(--blaze);font-size:11px;margin-top:8px;display:none}
+.reorder.on{display:block}
+.play{display:flex;gap:7px;margin-top:9px}
+.play button{flex:1;background:#2A5348;border:1px solid var(--blaze);color:#FFD9C6;
+  border-radius:3px;padding:8px;font-size:12px;cursor:pointer}
+.play button:hover{background:var(--blaze);color:#1A0B04}
+.live{font-family:var(--m);font-size:11px;color:var(--chalk);margin-top:6px;display:none}
+.live.on{display:block}
 .err{background:#3A1C10;border-left:3px solid var(--blaze);padding:12px 14px;font-size:13px;
   line-height:1.55}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);
@@ -816,18 +896,144 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
 <div id="map"></div>
 </div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-const map = L.map('map', {zoomControl:true}).setView([37.6624,-121.8747], 14);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
-}).addTo(map);
+/* ── map adapter ───────────────────────────────────────────────────────────
+   Google Maps when a key is configured, Leaflet otherwise. Both expose the same
+   four methods, so nothing downstream cares which one is running. A missing or
+   rejected key falls back rather than leaving a blank rectangle. */
+let MAP = null, layers = [], startMarker = null, DATA = null, LABELS = {};
+const HOME = [37.6624, -121.8747];
 
-let layers = [], startMarker = null, DATA = null, LABELS = {};
+function makeLeaflet() {
+  const m = L.map('map', {zoomControl:true}).setView(HOME, 14);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(m);
+  m.on('click', e => onMapClick(e.latlng.lat, e.latlng.lng));
+  return {
+    engine: 'leaflet',
+    setStart(lat, lon) {
+      if (startMarker) m.removeLayer(startMarker);
+      startMarker = L.circleMarker([lat, lon], {radius:7, color:'#E8622C', weight:3,
+        fillColor:'#0F1F1B', fillOpacity:1}).addTo(m).bindTooltip('Start');
+    },
+    clear() { layers.forEach(l => m.removeLayer(l)); layers = []; },
+    line(coords, on, i) {
+      const l = L.polyline(coords.map(c => [c[1], c[0]]), {
+        color: on ? '#E8622C' : '#9EC4D2', weight: on ? 6 : 3,
+        opacity: on ? 1 : .45, lineJoin:'round'}).addTo(m);
+      if (!on) l.on('click', () => select(i));
+      layers.push(l);
+      return l;
+    },
+    lineColor(coords, color, weight) {
+      const l = L.polyline(coords.map(c => [c[1], c[0]]),
+        {color, weight, opacity:1, lineJoin:'round'}).addTo(m);
+      layers.push(l);
+      return l;
+    },
+    runner(lat, lon) {
+      if (!this._run) {
+        this._run = L.circleMarker([lat, lon], {radius:9, color:'#fff', weight:3,
+          fillColor:'#E8622C', fillOpacity:1}).addTo(m);
+      } else this._run.setLatLng([lat, lon]);
+      this._run.bringToFront();
+    },
+    clearRunner() { if (this._run) { m.removeLayer(this._run); this._run = null; } },
+    panTo(lat, lon) { m.panTo([lat, lon], {animate:true, duration:.3}); },
+    focus(idx) {
+      const all = layers.filter(Boolean);
+      if (!all.length) return;
+      let b = null;
+      all.forEach(l => { b = b ? b.extend(l.getBounds()) : l.getBounds(); });
+      if (b) m.fitBounds(b, {padding:[35,35]});
+    }
+  };
+}
+
+function makeGoogle() {
+  const g = new google.maps.Map(document.getElementById('map'), {
+    center: {lat: HOME[0], lng: HOME[1]}, zoom: 14, mapTypeControl: true,
+    streetViewControl: true, fullscreenControl: true,
+    mapTypeId: google.maps.MapTypeId.ROADMAP
+  });
+  g.addListener('click', e => onMapClick(e.latLng.lat(), e.latLng.lng()));
+  return {
+    engine: 'google',
+    setStart(lat, lon) {
+      if (startMarker) startMarker.setMap(null);
+      startMarker = new google.maps.Marker({position:{lat, lng:lon}, map:g, title:'Start',
+        icon:{path: google.maps.SymbolPath.CIRCLE, scale:8, fillColor:'#0F1F1B',
+              fillOpacity:1, strokeColor:'#E8622C', strokeWeight:3}});
+    },
+    clear() { layers.forEach(l => l.setMap(null)); layers = []; },
+    line(coords, on, i) {
+      const path = coords.map(c => ({lat: c[1], lng: c[0]}));
+      const l = new google.maps.Polyline({path, map:g, geodesic:false,
+        strokeColor: on ? '#E8622C' : '#5A8DA6', strokeWeight: on ? 6 : 3,
+        strokeOpacity: on ? 1 : .6, zIndex: on ? 10 : 1});
+      if (!on) l.addListener('click', () => select(i));
+      layers.push(l);
+      return l;
+    },
+    lineColor(coords, color, weight) {
+      const l = new google.maps.Polyline({path: coords.map(c => ({lat:c[1], lng:c[0]})),
+        map:g, strokeColor:color, strokeWeight:weight, strokeOpacity:1, zIndex:15});
+      layers.push(l);
+      return l;
+    },
+    runner(lat, lon) {
+      if (!this._run) {
+        this._run = new google.maps.Marker({position:{lat, lng:lon}, map:g, zIndex:99,
+          icon:{path: google.maps.SymbolPath.CIRCLE, scale:9, fillColor:'#E8622C',
+                fillOpacity:1, strokeColor:'#fff', strokeWeight:3}});
+      } else this._run.setPosition({lat, lng:lon});
+    },
+    clearRunner() { if (this._run) { this._run.setMap(null); this._run = null; } },
+    panTo(lat, lon) { g.panTo({lat, lng:lon}); },
+    focus() {
+      if (!layers.length) return;
+      const b = new google.maps.LatLngBounds();
+      layers.forEach(l => l.getPath().forEach(pt => b.extend(pt)));
+      g.fitBounds(b, 40);
+    }
+  };
+}
+
+function onMapClick(lat, lon) {
+  document.getElementById('lat').value = lat.toFixed(5);
+  document.getElementById('lon').value = lon.toFixed(5);
+  MAP.setStart(lat, lon);
+}
+
+function startLeaflet(reason) {
+  const css = document.createElement('link');
+  css.rel = 'stylesheet';
+  css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+  document.head.appendChild(css);
+  const js = document.createElement('script');
+  js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+  js.onload = () => { MAP = makeLeaflet(); MAP.setStart(...HOME); if (DATA) draw(0); };
+  document.head.appendChild(js);
+  if (reason) console.warn('Falling back to OpenStreetMap:', reason);
+}
+
+window.gmapsReady = () => { MAP = makeGoogle(); MAP.setStart(...HOME); if (DATA) draw(0); };
+window.gm_authFailure = () => startLeaflet('Google Maps rejected the key');
+
+fetch('/api/config').then(r => r.json()).then(c => {
+  if (!c.google_maps_key) return startLeaflet(null);
+  const t = setTimeout(() => { if (!MAP) startLeaflet('Google Maps did not load'); }, 6000);
+  const sc = document.createElement('script');
+  sc.src = 'https://maps.googleapis.com/maps/api/js?key=' +
+           encodeURIComponent(c.google_maps_key) + '&callback=gmapsReady&loading=async';
+  sc.async = true;
+  sc.onload = () => clearTimeout(t);
+  sc.onerror = () => { clearTimeout(t); startLeaflet('Google Maps script blocked'); };
+  document.head.appendChild(sc);
+}).catch(() => startLeaflet('config unavailable'));
 
 fetch('/api/criteria').then(r => r.json()).then(c => {
   LABELS = Object.fromEntries(c.criteria.map(x => [x.key, x.label]));
@@ -841,7 +1047,7 @@ $('#locate').addEventListener('click', () => {
   navigator.geolocation.getCurrentPosition(p => {
     $('#lat').value = p.coords.latitude.toFixed(5);
     $('#lon').value = p.coords.longitude.toFixed(5);
-    map.setView([p.coords.latitude, p.coords.longitude], 15);
+    placeStart(p.coords.latitude, p.coords.longitude);
     $('#locate').textContent = 'Use my location';
   }, e => {
     $('#locate').textContent = 'Use my location';
@@ -852,37 +1058,97 @@ $('#locate').addEventListener('click', () => {
 document.querySelectorAll('.chip').forEach(b =>
   b.addEventListener('click', () => { $('#prompt').value = b.textContent; }));
 
-map.on('click', e => {
-  $('#lat').value = e.latlng.lat.toFixed(5);
-  $('#lon').value = e.latlng.lng.toFixed(5);
-  placeStart(e.latlng.lat, e.latlng.lng);
-});
-
-function placeStart(lat, lon) {
-  if (startMarker) map.removeLayer(startMarker);
-  startMarker = L.circleMarker([lat, lon], {radius:7, color:'#E8622C', weight:3,
-    fillColor:'#0F1F1B', fillOpacity:1}).addTo(map).bindTooltip('Start');
-}
-
-function clearRoutes(){ layers.forEach(l => map.removeLayer(l)); layers = []; }
+function placeStart(lat, lon) { if (MAP) MAP.setStart(lat, lon); }
 
 function draw(selected) {
-  clearRoutes();
+  if (!MAP || !DATA) return;
+  SELECTED = selected;
+  MAP.clear();
+  // unselected loops stay faint underneath so you can see the alternatives
   DATA.routes.forEach((r, i) => {
-    const on = i === selected;
-    const l = L.geoJSON(r.geojson, {style:{
-      color: on ? '#E8622C' : '#9EC4D2', weight: on ? 6 : 3,
-      opacity: on ? 1 : 0.45, lineJoin:'round'}}).addTo(map);
-    if (!on) l.on('click', () => select(i));
-    layers.push(l);
+    if (i !== selected) MAP.line(r.geojson.geometry.coordinates, false, i);
   });
-  const sel = layers[selected];
-  if (sel) { sel.bringToFront(); map.fitBounds(sel.getBounds(), {padding:[35,35]}); }
+  paintRoute(DATA.routes[selected], selected);
+  MAP.focus(selected);
+}
+
+function renderCands() {
+  const d = DATA;
+  document.getElementById('cands').innerHTML = d.routes.map((r, i) => `
+    <button class="cand ${i === SELECTED ? 'on' : ''}" data-i="${i}">
+      <div class="top"><span class="bib">${r.score.toFixed(0)}</span>
+        <span><b style="font-family:var(--d);font-size:17px">${r.distance_mi} mi</b>
+          <span style="color:var(--dim);font-size:12px"> · ${r.distance_km} km</span>
+          <div class="facts">${r.estimated_minutes} min · <b>${r.elevation_gain_m} m</b> climb
+            · <b>${r.turns}</b> turns · AQI <b>${r.aqi}</b></div></span></div>
+      <div class="bar"><i style="width:${r.score}%"></i></div>
+      <div class="breakdown">
+        ${Object.keys(r.scores).map(k => critRow(k, r.scores[k], r.weights[k],
+            r.estimated[k])).join('')}
+        ${radar(r, d.routes[i === 0 ? 1 : 0])}
+        ${elevSvg(r)}
+        <div class="play">
+          <button data-fly="${i}">Fly the route</button>
+          <button data-gpx="${i}">Download GPX</button></div>
+        <div class="live" id="live"></div>
+        ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
+          target="_blank" rel="noopener">Navigate in Google Maps</a>` : ''}
+      </div>
+    </button>`).join('');
+
+  document.querySelectorAll('.cand').forEach(el =>
+    el.addEventListener('click', e => {
+      if (e.target.closest('.nav') || e.target.closest('.gpx') || e.target.closest('[data-fly]'))
+        return;
+      select(+el.dataset.i);
+    }));
+  document.querySelectorAll('[data-gpx]').forEach(b =>
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      toGPX(DATA.routes[+b.dataset.gpx], +b.dataset.gpx);
+    }));
+  document.querySelectorAll('[data-fly]').forEach(b =>
+    b.addEventListener('click', e => { e.stopPropagation(); fly(+b.dataset.fly); }));
+}
+
+function wireSliders() {
+  const box = document.getElementById('slidebox');
+  if (!box || !DATA) return;
+  box.innerHTML = sliderPanel();
+  box.querySelectorAll('[data-w]').forEach(inp =>
+    inp.addEventListener('input', () => {
+      USER_W = USER_W || {...DATA.weights.applied};
+      USER_W[inp.dataset.w] = +inp.value / 100;
+      box.querySelector(`[data-wv="${inp.dataset.w}"]`).textContent = inp.value;
+      rescore();
+    }));
+  box.querySelectorAll('[data-preset]').forEach(b =>
+    b.addEventListener('click', () => {
+      const p = b.dataset.preset;
+      if (p === 'ai') USER_W = null;
+      if (p === 'safe') USER_W = {...DATA.weights.applied, safety: .40, simplicity: .12};
+      if (p === 'clean') USER_W = {...DATA.weights.applied, air: .40, green: .16};
+      wireSliders();
+      rescore();
+    }));
 }
 
 function select(i) {
   document.querySelectorAll('.cand').forEach((el, j) => el.classList.toggle('on', j === i));
   draw(i);
+  refreshPaintBar();
+}
+
+function refreshPaintBar() {
+  const bar = document.getElementById('paintbar');
+  if (!bar || !DATA) return;
+  bar.innerHTML = paintBar();
+  bar.querySelectorAll('[data-paint]').forEach(b =>
+    b.addEventListener('click', () => {
+      PAINT_MODE = b.dataset.paint;
+      draw(SELECTED);
+      refreshPaintBar();
+    }));
 }
 
 let BOOSTED = [];
@@ -892,6 +1158,202 @@ function critRow(key, val, weight, estimated) {
   return `<div class="crit"><span class="${estimated?'est':''}${up}">${esc(LABELS[key]||key)}${up?' \u2191':''}${estimated?' *':''}</span>
     <span class="track"><i class="${cls}" style="width:${Math.max(2,val)}%"></i></span>
     <span class="v">${Math.round(val)}</span></div>`;
+}
+
+/* ── paint the route by what the data says, segment by segment ──────────────
+   OpenRouteService returns extra_info as [fromIndex, toIndex, value] spans along
+   the geometry. Colouring each span turns the abstract score into something you
+   can see on the map: where the greenery is, where the noise is, where it climbs. */
+const PAINT = {
+  route:     {label:'Route',      scale:null},
+  green:     {label:'Greenery',   scale:v => v/10,        good:'high'},
+  noise:     {label:'Noise',      scale:v => v/10,        good:'low'},
+  steepness: {label:'Steepness',  scale:v => Math.min(1, Math.abs(v)/5), good:'low'},
+  surface:   {label:'Surface',    scale:v => 1 - (SURF[v] ?? .5), good:'low'},
+  waytypes:  {label:'Path type',  scale:v => 1 - (WAY[v] ?? .5),  good:'low'},
+};
+const SURF = {1:.80,2:.95,3:.90,4:.85,5:.70,6:.60,7:.55,8:.45,9:.50,10:.40,11:.55,
+              12:.35,13:.30,14:.25,15:.40,16:.65,17:.30,18:.20,20:.50};
+const WAY  = {0:.55,1:.20,2:.40,3:.55,4:.90,5:.85,6:.88,7:.92,8:.60,9:.30,10:.15};
+let PAINT_MODE = 'route';
+
+function ramp(t, goodIsHigh) {
+  const x = Math.max(0, Math.min(1, goodIsHigh ? t : 1 - t));   // 1 = good
+  const stops = [[0,'#C7482A'], [0.5,'#E8B84B'], [1,'#4FA96E']];
+  let a = stops[0], b = stops[2];
+  for (let i = 0; i < stops.length - 1; i++)
+    if (x >= stops[i][0] && x <= stops[i+1][0]) { a = stops[i]; b = stops[i+1]; }
+  const f = (b[0] - a[0]) ? (x - a[0]) / (b[0] - a[0]) : 0;
+  const hex = h => [1,3,5].map(i => parseInt(h.slice(i, i+2), 16));
+  const [r1,g1,b1] = hex(a[1]), [r2,g2,b2] = hex(b[1]);
+  const m = (p,q) => Math.round(p + (q - p) * f);
+  return `rgb(${m(r1,r2)},${m(g1,g2)},${m(b1,b2)})`;
+}
+
+function paintRoute(r, idx) {
+  const spans = (r.extras || {})[PAINT_MODE];
+  const coords = r.geojson.geometry.coordinates;
+  if (PAINT_MODE === 'route' || !spans || !spans.length) {
+    MAP.line(coords, true, idx);
+    return false;
+  }
+  const cfg = PAINT[PAINT_MODE];
+  spans.forEach(([a, b, v]) => {
+    const seg = coords.slice(a, Math.min(b + 1, coords.length));
+    if (seg.length < 2) return;
+    MAP.lineColor(seg, ramp(cfg.scale(v), cfg.good === 'high'), 6);
+  });
+  return true;
+}
+
+function paintBar() {
+  const r = DATA.routes[SELECTED] || {};
+  const avail = Object.keys(PAINT).filter(k =>
+    k === 'route' || ((r.extras || {})[k] || []).length);
+  const legend = PAINT_MODE === 'route' ? '' :
+    `<div class="legend"><span><i style="background:#4FA96E"></i>better</span>
+     <span><i style="background:#E8B84B"></i>mixed</span>
+     <span><i style="background:#C7482A"></i>worse</span>
+     <span style="margin-left:auto">every segment coloured from the routing data</span></div>`;
+  return `<label>Paint the map by</label><div class="paint">${
+    avail.map(k => `<button data-paint="${k}" aria-pressed="${k===PAINT_MODE}">${
+      PAINT[k].label}</button>`).join('')}</div>${legend}`;
+}
+
+function elevSvg(r) {
+  const pts = (r.elevation || {}).points || [];
+  if (pts.length < 3) return '';
+  const lo = Math.min(...pts), hi = Math.max(...pts), span = Math.max(1, hi - lo);
+  const d = pts.map((v, i) =>
+    `${(i / (pts.length - 1)) * 100},${100 - ((v - lo) / span) * 100}`).join(' ');
+  return `<div class="elev">
+    <svg viewBox="0 0 100 100" preserveAspectRatio="none">
+      <polygon points="0,100 ${d} 100,100" fill="#E8622C" opacity=".22"/>
+      <polyline points="${d}" fill="none" stroke="#E8622C" stroke-width="1.6"
+        vector-effect="non-scaling-stroke"/></svg>
+    <div class="cap"><span>${Math.round(lo)} m</span>
+      <span>+${r.elevation_gain_m} m climb · ${r.climb_per_km} m/km</span>
+      <span>${Math.round(hi)} m</span></div></div>`;
+}
+
+function toGPX(r, i) {
+  const pts = r.geojson.geometry.coordinates.map(c =>
+    `<trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${
+      c.length > 2 ? `<ele>${c[2].toFixed(1)}</ele>` : ''}</trkpt>`).join('');
+  const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Route Planner" xmlns="http://www.topografix.com/GPX/1/1">
+<metadata><name>${r.distance_mi} mi loop, score ${r.score}</name></metadata>
+<trk><name>Route ${i + 1}</name><trkseg>${pts}</trkseg></trk></gpx>`;
+  const url = URL.createObjectURL(new Blob([gpx], {type:'application/gpx+xml'}));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `route-${r.distance_mi}mi-score${Math.round(r.score)}.gpx`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+let SELECTED = 0, USER_W = null, ANIM = null;
+
+/* ── radar: all nine criteria at a glance ──────────────────────────────────
+   A bar chart shows nine numbers. A radar shows the SHAPE of a route — you can
+   see instantly that one is fast but filthy and another is slow but clean. */
+function radar(r, rival) {
+  const keys = Object.keys(r.scores), n = keys.length, R = 66, cx = 100, cy = 88;
+  const pt = (i, v) => {
+    const a = (Math.PI * 2 * i) / n - Math.PI / 2;
+    return [cx + Math.cos(a) * R * (v / 100), cy + Math.sin(a) * R * (v / 100)];
+  };
+  const poly = o => keys.map((k, i) => pt(i, o.scores[k]).map(x => x.toFixed(1)).join(',')).join(' ');
+  const rings = [25, 50, 75, 100].map(p =>
+    `<polygon points="${keys.map((_, i) => pt(i, p).map(x => x.toFixed(1)).join(',')).join(' ')}"
+      fill="none" stroke="#2C544A" stroke-width=".7"/>`).join('');
+  const spokes = keys.map((k, i) => {
+    const [x, y] = pt(i, 100);
+    const [lx, ly] = pt(i, 128);
+    return `<line x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"
+      stroke="#2C544A" stroke-width=".6"/>
+      <text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" fill="#8FAFA4" font-size="6.5"
+        text-anchor="middle" dominant-baseline="middle">${
+        (LABELS[k] || k).split(' ')[0]}</text>`;
+  }).join('');
+  const rivalPoly = rival ?
+    `<polygon points="${poly(rival)}" fill="none" stroke="#5A8DA6" stroke-width="1.2"
+      stroke-dasharray="3 2"/>` : '';
+  return `<div class="radar"><svg viewBox="0 0 200 176">
+    ${rings}${spokes}${rivalPoly}
+    <polygon points="${poly(r)}" fill="#E8622C" fill-opacity=".28" stroke="#E8622C"
+      stroke-width="1.8"/></svg>
+    <div style="font-size:10px;color:var(--dim);text-align:center;margin-top:-4px">
+      solid = this route${rival ? ' · dashed = next best' : ''}</div></div>`;
+}
+
+/* ── weight sliders: hand the judges the controls ──────────────────────────
+   All nine sub-scores are already computed, so re-ranking is instant and local.
+   Drag safety up and watch the winner change in front of you. */
+function sliderPanel() {
+  const w = USER_W || DATA.weights.applied;
+  return `<div class="sliders">
+    <h4>Tune it yourself</h4>
+    <p>These are the weights behind the ranking. Move one and everything re-ranks
+       instantly — no request, no waiting.</p>
+    ${Object.keys(w).map(k => `<div class="sl">
+      <span>${esc(LABELS[k] || k)}</span>
+      <input type="range" min="0" max="40" value="${Math.round(w[k] * 100)}"
+        data-w="${k}">
+      <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`).join('')}
+    <div class="slfoot">
+      <button data-preset="ai">Back to AI weights</button>
+      <button data-preset="safe">Max safety</button>
+      <button data-preset="clean">Max clean air</button>
+    </div>
+    <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
+  </div>`;
+}
+
+function rescore() {
+  const raw = USER_W || DATA.weights.applied;
+  const tot = Object.values(raw).reduce((a, b) => a + b, 0) || 1;
+  const w = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v / tot]));
+  const before = DATA.routes.map(r => r.id).join(',');
+  DATA.routes.forEach(r => {
+    r.score = +Object.keys(w).reduce((s, k) => s + w[k] * r.scores[k], 0).toFixed(1);
+    r.weights = w;
+  });
+  DATA.routes.sort((a, b) => b.score - a.score);
+  renderCands();
+  const after = DATA.routes.map(r => r.id).join(',');
+  const el = document.getElementById('reorder');
+  if (el) {
+    const winnerChanged = before.split(',')[0] !== after.split(',')[0];
+    el.textContent = winnerChanged
+      ? 'The ranking changed — a different loop now wins.'
+      : 'The ranking changed — the order below just shifted.';
+    el.classList.toggle('on', before !== after);
+  }
+  select(0);
+}
+
+/* ── flythrough: run the route in front of them ──────────────────────────── */
+function fly(i) {
+  const r = DATA.routes[i], pts = r.geojson.geometry.coordinates;
+  if (ANIM) { cancelAnimationFrame(ANIM.raf); ANIM = null; MAP.clearRunner(); }
+  const live = document.getElementById('live');
+  if (live) live.classList.add('on');
+  const t0 = performance.now(), dur = 9000;
+  const step = now => {
+    const t = Math.min(1, (now - t0) / dur);
+    const idx = Math.min(pts.length - 1, Math.floor(t * (pts.length - 1)));
+    const c = pts[idx];
+    MAP.runner(c[1], c[0]);
+    if (idx % 12 === 0) MAP.panTo(c[1], c[0]);
+    if (live) live.textContent =
+      `${(r.distance_km * t).toFixed(2)} km of ${r.distance_km} km` +
+      (c.length > 2 ? ` · ${c[2].toFixed(0)} m elevation` : '') +
+      ` · ${Math.round(r.estimated_minutes * t)} min`;
+    if (t < 1) ANIM = {raf: requestAnimationFrame(step)};
+    else { ANIM = null; MAP.focus(i); }
+  };
+  ANIM = {raf: requestAnimationFrame(step)};
 }
 
 function render(d) {
@@ -912,7 +1374,14 @@ function render(d) {
         ? d.request.emphasis_labels.map(x => `<span class="pref">${esc(x)}</span>`).join('')
         : '<span class="pref none">no preference stated — using the default balance for ' +
           esc(d.request.activity) + '</span>'}</div>
+    ${d.daylight && d.daylight.finishes_in_dark
+      ? `<div class="dark">Sunset is at <b>${esc(d.daylight.sunset)}</b> and this takes about
+         <b>${d.daylight.minutes_needed} min</b>. You would be out in the dark for the last
+         <b>${d.daylight.dark_minutes} minutes</b> — take a light, or pick a shorter loop.</div>`
+      : ''}
     <div class="summary"><div class="tagline">Recommendation</div>${esc(d.summary)}</div>
+    <div id="paintbar"></div>
+    <div id="slidebox"></div>
     <label>Candidate loops</label>
     <div id="cands"></div>
     <p class="note">Air data: ${esc(a.source||'—')}. Distance parsed by ${esc(d.request.parsed_by)}.
@@ -922,29 +1391,10 @@ function render(d) {
       ranking. An asterisk marks a criterion OpenRouteService did not supply for this route,
       where a documented baseline was used instead.</p>`;
 
-  $('#cands').innerHTML = d.routes.map((r, i) => `
-    <button class="cand ${i===0?'on':''}" data-i="${i}">
-      <div class="top"><span class="bib">${r.score.toFixed(0)}</span>
-        <span><b style="font-family:var(--d);font-size:17px">${r.distance_mi} mi</b>
-          <span style="color:var(--dim);font-size:12px"> · ${r.distance_km} km</span>
-          <div class="facts">${r.estimated_minutes} min · <b>${r.elevation_gain_m} m</b> climb
-            · <b>${r.turns}</b> turns · AQI <b>${r.aqi}</b></div></span></div>
-      <div class="bar"><i style="width:${r.score}%"></i></div>
-      <div class="breakdown">
-        ${Object.keys(r.scores).map(k => critRow(k, r.scores[k], r.weights[k],
-            r.estimated[k])).join('')}
-        ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
-          target="_blank" rel="noopener">Navigate in Google Maps</a>` : ''}
-      </div>
-    </button>`).join('');
-
-  document.querySelectorAll('.cand').forEach(el =>
-    el.addEventListener('click', e => {
-      if (e.target.closest('.nav')) return;   // let the Google Maps link through
-      select(+el.dataset.i);
-    }));
-
+  renderCands();
   draw(0);
+  refreshPaintBar();
+  wireSliders();
   placeStart(...d.routes[0].geojson.geometry.coordinates[0].slice(0,2).reverse());
 }
 
@@ -972,7 +1422,6 @@ $('#go').addEventListener('click', async () => {
   }
 });
 
-placeStart(37.6624, -121.8747);
 </script>
 </body>
 </html>
