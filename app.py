@@ -222,6 +222,7 @@ def s_noise(extras: dict) -> tuple[float, bool]:
     constant made every route score identically — which is why the slider did
     nothing. Road class is always returned, so this always discriminates.
     """
+    signals, weights = [], []
     block = (extras or {}).get("noise")
     if block and block.get("values"):
         num = den = 0.0
@@ -230,9 +231,15 @@ def s_noise(extras: dict) -> tuple[float, bool]:
             num += (1.0 - int(val) / 10.0) * span
             den += span
         if den:
-            return 100.0 * (num / den), True
+            signals.append(num / den)
+            weights.append(0.4)
     v = _extra_fraction(extras, "waytype", WAYTYPE_QUIET, 0)
-    return (v, True) if v is not None else (70.0, False)
+    if v is not None:
+        signals.append(v / 100.0)
+        weights.append(0.6)
+    if not signals:
+        return 70.0, False
+    return 100.0 * sum(a * b for a, b in zip(signals, weights)) / sum(weights), True
 
 
 def s_safety(extras: dict, steps: int, km: float) -> tuple[float, bool]:
@@ -472,12 +479,18 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     # A triangle start -> p1 -> p2 -> start of side r has perimeter about 3r along
     # straight lines; real streets add roughly 25%, so aim a little short.
     r = (target_m / 3.0) * 0.78
-    bearings = [0, 60, 120, 180, 240, 300][:n]
+    # Alternating the reach as well as the bearing pushes some loops further out,
+    # where the streets, surfaces and greenery genuinely differ from the blocks
+    # right around the start.
+    bearings = [(0, 1.0), (60, 0.75), (120, 1.15), (180, 1.0), (240, 0.75),
+                (300, 1.15)][:n]
 
-    def one(b):
-        """One bearing, one loop. Run these in parallel or the request times out."""
-        p1 = offset(lat, lon, b, r)
-        p2 = offset(lat, lon, b + 72, r)
+    def one(spec):
+        """One bearing and reach, one loop. Parallel, or the request times out."""
+        b, scale = spec
+        rr = r * scale
+        p1 = offset(lat, lon, b, rr)
+        p2 = offset(lat, lon, b + 72, rr)
         body = {
             "coordinates": [[lon, lat], [p1[1], p1[0]], [p2[1], p2[0]], [lon, lat]],
             "elevation": True,
@@ -795,7 +808,11 @@ def diagnose(lat: float = 37.6624, lon: float = -121.8747, prompt: str = "5 km r
     return {
         "candidates": len(r["routes"]),
         "spread_per_criterion": r.get("spread"),
-        "dead_sliders": [k for k, v in (r.get("spread") or {}).items() if v < 2],
+        "normalised_spread": {k: round(max(x["rel"][k] for x in r["routes"])
+                                       - min(x["rel"][k] for x in r["routes"]), 1)
+                              for k in r["routes"][0].get("rel", {})},
+        "dead_sliders": [k for k, v in (r.get("spread") or {}).items()
+                         if v < 0.5 and k not in ("air", "weather")],
         "green_features_found": r.get("green_features"),
         "air_source": r["air"]["source"],
         "estimated_flags": r["routes"][0]["estimated"],
@@ -868,6 +885,24 @@ def _plan(req: PlanRequest):
         for k in routes[0]["scores"]:
             vals = [r["scores"][k] for r in routes]
             spread[k] = round(max(vals) - min(vals), 1)
+
+    # Normalise each criterion across the candidate set, then re-rank on that.
+    # Absolute scores are kept for display; ranking uses the normalised values so
+    # a criterion with a small absolute range still counts for its full weight.
+    if len(routes) > 1:
+        for k in routes[0]["scores"]:
+            vals = [r["scores"][k] for r in routes]
+            lo, hi = min(vals), max(vals)
+            rng = hi - lo
+            for r in routes:
+                r.setdefault("rel", {})
+                r["rel"][k] = round(50.0 if rng < 0.5
+                                    else 100.0 * (r["scores"][k] - lo) / rng, 1)
+        for r in routes:
+            r["score"] = round(sum(weights[k] * r["rel"][k] for k in weights), 1)
+    else:
+        for r in routes:
+            r["rel"] = dict(r["scores"])
     # Air and weather are measured once at the start point, so they are the same for
     # every candidate by definition. That is not a broken slider, and the interface
     # should say so rather than implying the knob is faulty.
@@ -1539,7 +1574,7 @@ function sliderPanel() {
     ${Object.keys(w).map(k => {
       const sp = (DATA.spread || {})[k] ?? 99;
       const byDesign = (DATA.uniform_by_design || []).includes(k);
-      const dead = sp < 2;
+      const dead = sp < 0.5 && !byDesign;
       const note = byDesign
         ? ' <span style="font-size:9px">(same for all)</span>'
         : dead ? ' <span style="font-size:9px">(tied)</span>' : '';
@@ -1569,7 +1604,10 @@ function rescore() {
   const before = DATA.routes.map(r => r.id).join(',');
   DATA.routes.forEach(r => {
     const prev = r.score;
-    r.score = +Object.keys(w).reduce((s, k) => s + w[k] * r.scores[k], 0).toFixed(1);
+    // rank on the normalised values, exactly as the server does, so a criterion
+    // whose absolute range is small still carries its full weight
+    const src = r.rel || r.scores;
+    r.score = +Object.keys(w).reduce((s, k) => s + w[k] * (src[k] ?? 50), 0).toFixed(1);
     r.delta = +(r.score - prev).toFixed(1);
     r.weights = w;
   });
