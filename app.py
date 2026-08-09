@@ -5,6 +5,7 @@ import subprocess
 from typing import Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from openai import OpenAI
 import uvicorn
@@ -19,7 +20,6 @@ os.makedirs(WORKSHOP_DIR, exist_ok=True)
 
 def safe_path(rel_path: str) -> str:
     """Ensures paths remain strictly inside WORKSHOP_DIR."""
-    # Strip leading slashes / dots
     rel_path = rel_path.lstrip("/\\")
     full_path = os.path.abspath(os.path.join(WORKSHOP_DIR, rel_path))
     if not full_path.startswith(WORKSHOP_DIR):
@@ -39,6 +39,15 @@ def seed_demo_files():
 seed_demo_files()
 
 app = FastAPI(title="AI Code Editor & Terminal Sandbox")
+
+# Enable CORS for all origins to prevent browser fetch blocks
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Models
 class PromptRequest(BaseModel):
@@ -63,7 +72,7 @@ class DeleteFileRequest(BaseModel):
 # -----------------------------------------------------------------------------
 @app.get("/api/files")
 def list_files():
-    """Lists all files and directories in ./workshop for the sidebar file explorer."""
+    """Lists all files and directories in ./workshop."""
     items = []
     for root, dirs, files in os.walk(WORKSHOP_DIR):
         rel_root = os.path.relpath(root, WORKSHOP_DIR)
@@ -226,7 +235,7 @@ def execute_command(req: ExecuteRequest):
         return {"command": cmd, "stdout": "", "stderr": f"Error: {str(err)}", "returncode": 1}
 
 # -----------------------------------------------------------------------------
-# 4. Full Web Application (Interactive Editor + Terminal + Sidebar)
+# 4. Ultra-Robust Web Application Frontend
 # -----------------------------------------------------------------------------
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -249,7 +258,6 @@ HTML_CONTENT = """<!DOCTYPE html>
             height: 100vh;
             width: 100vw;
         }
-        /* Top Navigation Bar */
         .top-nav {
             height: 40px;
             background-color: #252526;
@@ -263,10 +271,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         .nav-title { font-weight: bold; color: #ffffff; display: flex; align-items: center; gap: 8px; }
         .nav-badge { background-color: #1e1e1e; border: 1px solid #333333; padding: 2px 8px; border-radius: 3px; font-size: 11px; color: #00ff66; }
         
-        /* Main Layout */
         .main-layout { display: flex; flex: 1; overflow: hidden; }
 
-        /* Sidebar Explorer */
         .sidebar {
             width: 260px;
             background-color: #252526;
@@ -291,37 +297,38 @@ HTML_CONTENT = """<!DOCTYPE html>
             background: #2d2d2d;
             color: #cccccc;
             border: 1px solid #3c3c3c;
-            padding: 2px 6px;
+            padding: 3px 8px;
             font-size: 11px;
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: 3px;
             font-family: inherit;
         }
         .action-btn-sm:hover { background: #3e3e42; color: #ffffff; }
 
-        /* File Item List */
-        .file-list { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+        .file-list { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
         .file-item {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 6px 8px;
+            padding: 8px 10px;
             font-size: 12px;
             cursor: pointer;
             border-radius: 3px;
             color: #cccccc;
+            background-color: #1e1e1e;
+            border: 1px solid #333333;
+            user-select: none;
         }
-        .file-item:hover { background-color: #2a2d2e; color: #ffffff; }
-        .file-item.active { background-color: #37373d; color: #00ff66; font-weight: bold; }
-        .file-delete-btn { opacity: 0; color: #f44747; border: none; background: none; cursor: pointer; font-size: 12px; }
-        .file-item:hover .file-delete-btn { opacity: 1; }
+        .file-item:hover { background-color: #0e639c; color: #ffffff; border-color: #1177bb; }
+        .file-item.active { background-color: #0e639c; color: #ffffff; font-weight: bold; border-color: #007acc; }
+        .file-delete-btn { color: #f44747; border: none; background: none; cursor: pointer; font-size: 12px; padding: 0 4px; }
+        .file-delete-btn:hover { color: #ffffff; }
 
-        /* Template Buttons */
         .template-btn {
             background-color: #2d2d2d;
             color: #cccccc;
             border: 1px solid #3c3c3c;
-            padding: 7px 10px;
+            padding: 8px 10px;
             font-size: 11px;
             font-family: inherit;
             text-align: left;
@@ -331,10 +338,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         .template-btn:hover { background-color: #0e639c; color: #ffffff; border-color: #1177bb; }
 
-        /* Editor & Terminal Area Split */
         .content-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; background-color: #1e1e1e; }
         
-        /* Code Editor Window */
         .editor-pane {
             height: 55%;
             display: flex;
@@ -342,7 +347,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             border-bottom: 1px solid #333333;
         }
         .editor-toolbar {
-            height: 34px;
+            height: 36px;
             background-color: #2d2d2d;
             border-bottom: 1px solid #333333;
             display: flex;
@@ -356,12 +361,12 @@ HTML_CONTENT = """<!DOCTYPE html>
             background-color: #238636;
             color: #ffffff;
             border: none;
-            padding: 4px 12px;
+            padding: 5px 14px;
             font-size: 11px;
             font-family: inherit;
             font-weight: bold;
             cursor: pointer;
-            border-radius: 2px;
+            border-radius: 3px;
         }
         .save-btn:hover { background-color: #2ea043; }
 
@@ -379,7 +384,6 @@ HTML_CONTENT = """<!DOCTYPE html>
             tab-size: 4;
         }
 
-        /* Terminal Window */
         .terminal-pane {
             height: 45%;
             display: flex;
@@ -408,14 +412,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         .log-stderr { color: #f44747; }
         .log-exp { color: #ce9178; font-style: italic; }
 
-        /* Input Control Bar */
         .input-bar { display: flex; gap: 8px; }
         .prompt-input {
             flex: 1;
             background-color: #252526;
             border: 1px solid #333333;
             color: #d4d4d4;
-            padding: 8px 12px;
+            padding: 10px 12px;
             font-family: inherit;
             font-size: 12px;
             border-radius: 3px;
@@ -426,7 +429,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             background-color: #0e639c;
             color: #ffffff;
             border: none;
-            padding: 8px 16px;
+            padding: 10px 18px;
             font-family: inherit;
             font-size: 12px;
             font-weight: bold;
@@ -435,7 +438,6 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         .submit-btn:hover { background-color: #1177bb; }
 
-        /* Confirmation Modal Overlay */
         .modal-overlay {
             display: none;
             position: fixed;
@@ -458,23 +460,20 @@ HTML_CONTENT = """<!DOCTYPE html>
         .cmd-box { background-color: #0d0d0d; border: 1px solid #333333; padding: 10px; font-size: 12px; color: #00ff66; border-radius: 3px; white-space: pre-wrap; }
         .exp-box { background-color: #1e1e1e; border: 1px solid #333333; padding: 10px; font-size: 12px; color: #ce9178; border-radius: 3px; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
-        .btn-cancel { background-color: #3a3d41; color: #ffffff; border: none; padding: 6px 14px; font-family: inherit; font-size: 12px; cursor: pointer; border-radius: 2px; }
-        .btn-approve { background-color: #238636; color: #ffffff; border: none; padding: 6px 16px; font-family: inherit; font-size: 12px; font-weight: bold; cursor: pointer; border-radius: 2px; }
+        .btn-cancel { background-color: #3a3d41; color: #ffffff; border: none; padding: 8px 14px; font-family: inherit; font-size: 12px; cursor: pointer; border-radius: 3px; }
+        .btn-approve { background-color: #238636; color: #ffffff; border: none; padding: 8px 16px; font-family: inherit; font-size: 12px; font-weight: bold; cursor: pointer; border-radius: 3px; }
         .btn-approve:hover { background-color: #2ea043; }
     </style>
 </head>
 <body>
 
 <div class="app-container">
-    <!-- Top Header -->
     <div class="top-nav">
         <div class="nav-title">⚡ AI CODE EDITOR & TERMINAL</div>
         <div class="nav-badge">LOCAL SANDBOX: ./workshop</div>
     </div>
 
-    <!-- Main Workspace Split -->
     <div class="main-layout">
-        <!-- Sidebar Explorer -->
         <div class="sidebar">
             <div class="section-header">
                 <span>Workshop Files</span>
@@ -495,9 +494,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             <button class="template-btn" onclick="runTemplate('Create a folder named data')">📁 Create data folder</button>
         </div>
 
-        <!-- Right Workspace: Code Editor + Terminal -->
         <div class="content-area">
-            <!-- Top: Interactive Code Editor Pane -->
             <div class="editor-pane">
                 <div class="editor-toolbar">
                     <div>📄 Active File: <span class="active-file-label" id="activeFileName">Select a file from sidebar</span></div>
@@ -506,7 +503,6 @@ HTML_CONTENT = """<!DOCTYPE html>
                 <textarea class="code-textarea" id="codeEditor" placeholder="Click any file on the left sidebar to view & edit code..." disabled></textarea>
             </div>
 
-            <!-- Bottom: Terminal Window & AI Prompt Bar -->
             <div class="terminal-pane">
                 <div class="section-header">
                     <span>Terminal Log Output</span>
@@ -518,7 +514,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 --------------------------------------------------------------------------------------------------
 </div>
                 <div class="input-bar">
-                    <input type="text" class="prompt-input" id="promptInput" placeholder="Type prompt (e.g. 'Run main.py' or 'Create test.py')..." onkeydown="if(event.key==='Enter') submitPrompt()">
+                    <input type="text" class="prompt-input" id="promptInput" placeholder="Type prompt (e.g. 'Run main.py' or 'Create test.py')...">
                     <button class="submit-btn" id="submitBtn" onclick="submitPrompt()">GENERATE COMMAND</button>
                 </div>
             </div>
@@ -526,7 +522,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
 </div>
 
-<!-- Command Confirmation Modal -->
 <div class="modal-overlay" id="confirmModal">
     <div class="modal-box">
         <div class="modal-title">CONFIRM COMMAND EXECUTION</div>
@@ -541,74 +536,108 @@ HTML_CONTENT = """<!DOCTYPE html>
 </div>
 
 <script>
-    let activeFilePath = null;
-    let pendingCommand = "";
-    let pendingExplanation = "";
+    var activeFilePath = null;
+    var pendingCommand = "";
+    var pendingExplanation = "";
+
+    function escapeHtml(text) {
+        if (!text) return "";
+        return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
+    function appendLog(htmlText) {
+        var log = document.getElementById('terminalLog');
+        if (log) {
+            log.innerHTML += htmlText + '\n';
+            log.scrollTop = log.scrollHeight;
+        }
+    }
+
+    function clearLog() {
+        var log = document.getElementById('terminalLog');
+        if (log) {
+            log.innerHTML = '<span class="log-system">[SYSTEM] Terminal log cleared.</span>\n';
+        }
+    }
 
     async function loadFileList() {
-        const fileListEl = document.getElementById('fileList');
+        var fileListEl = document.getElementById('fileList');
+        if (!fileListEl) return;
+        
         try {
-            const res = await fetch('/api/files');
-            const data = await res.json();
+            var res = await fetch('/api/files');
+            var data = await res.json();
             fileListEl.innerHTML = '';
             
             if (!data.files || data.files.length === 0) {
-                fileListEl.innerHTML = '<div style="font-size:11px; color:#888888; padding:4px;">(empty directory)</div>';
+                fileListEl.innerHTML = '<div style="font-size:11px; color:#888888; padding:6px;">(empty directory)</div>';
                 return;
             }
 
-            data.files.forEach(item => {
-                const div = document.createElement('div');
+            data.files.forEach(function(item) {
+                var div = document.createElement('div');
                 div.className = 'file-item' + (activeFilePath === item.path ? ' active' : '');
                 
-                const icon = item.is_dir ? '📁' : '📄';
-                div.innerHTML = `
-                    <span onclick="openFile('${item.path}')">${icon} ${escapeHtml(item.name)}</span>
-                    <button class="file-delete-btn" onclick="event.stopPropagation(); deleteFileItem('${item.path}')" title="Delete file">🗑️</button>
-                `;
+                var icon = item.is_dir ? '📁' : '📄';
+                div.innerHTML = '<span>' + icon + ' ' + escapeHtml(item.name) + '</span>' +
+                                '<button class="file-delete-btn" title="Delete file">🗑️</button>';
+                
+                div.onclick = function(e) {
+                    if (e.target.classList.contains('file-delete-btn')) {
+                        e.stopPropagation();
+                        deleteFileItem(item.path);
+                    } else {
+                        openFile(item.path);
+                    }
+                };
+
                 fileListEl.appendChild(div);
             });
         } catch (err) {
-            fileListEl.innerHTML = '<div style="color:#f44747; font-size:11px;">Error loading files</div>';
+            fileListEl.innerHTML = '<div style="color:#f44747; font-size:11px; padding:6px;">Error loading files</div>';
         }
     }
 
     async function openFile(filePath) {
         activeFilePath = filePath;
-        document.getElementById('activeFileName').textContent = filePath;
-        const editor = document.getElementById('codeEditor');
-        const saveBtn = document.getElementById('saveBtn');
+        var nameLabel = document.getElementById('activeFileName');
+        var editor = document.getElementById('codeEditor');
+        var saveBtn = document.getElementById('saveBtn');
+
+        if (nameLabel) nameLabel.textContent = filePath;
 
         try {
-            const res = await fetch(`/api/file/content?path=${encodeURIComponent(filePath)}`);
-            if (!res.ok) throw new Error('Could not read file');
-            const data = await res.json();
+            var res = await fetch('/api/file/content?path=' + encodeURIComponent(filePath));
+            if (!res.ok) throw new Error('Could not read file content');
+            var data = await res.json();
             
-            editor.value = data.content;
-            editor.disabled = false;
-            saveBtn.disabled = false;
-            loadFileList();
+            if (editor) {
+                editor.value = data.content;
+                editor.disabled = false;
+            }
+            if (saveBtn) saveBtn.disabled = false;
         } catch (err) {
-            alert('Failed to open file: ' + err.message);
+            appendLog('<span class="log-stderr">[ERROR] Could not open ' + escapeHtml(filePath) + ': ' + escapeHtml(err.message) + '</span>');
         }
     }
 
     async function saveActiveFile() {
         if (!activeFilePath) return;
-        const editor = document.getElementById('codeEditor');
-        const content = editor.value;
+        var editor = document.getElementById('codeEditor');
+        if (!editor) return;
+        var content = editor.value;
 
         try {
-            const res = await fetch('/api/file/save', {
+            var res = await fetch('/api/file/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ path: activeFilePath, content: content })
             });
-            const data = await res.json();
+            var data = await res.json();
             if (res.ok) {
-                appendLog(`<span class="log-system">[FILE SAVED] ${escapeHtml(activeFilePath)} successfully updated.</span>`);
+                appendLog('<span class="log-system">[FILE SAVED] ' + escapeHtml(activeFilePath) + ' successfully updated.</span>');
             } else {
-                alert('Save error: ' + data.detail);
+                alert('Save error: ' + (data.detail || 'Unknown error'));
             }
         } catch (err) {
             alert('Save error: ' + err.message);
@@ -616,22 +645,24 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     async function createNewFile() {
-        const path = prompt('Enter new filename (e.g. app.py, test.txt):');
+        var path = prompt('Enter new filename (e.g. app.py, test.txt):');
+        if (!path) return;
+        path = path.trim();
         if (!path) return;
         
         try {
-            const res = await fetch('/api/file/create', {
+            var res = await fetch('/api/file/create', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ path: path })
             });
             if (res.ok) {
                 await loadFileList();
-                openFile(path);
-                appendLog(`<span class="log-system">[FILE CREATED] ${escapeHtml(path)} created.</span>`);
+                await openFile(path);
+                appendLog('<span class="log-system">[FILE CREATED] ' + escapeHtml(path) + ' created.</span>');
             } else {
-                const data = await res.json();
-                alert('Create error: ' + data.detail);
+                var data = await res.json();
+                alert('Create error: ' + (data.detail || 'Failed to create file'));
             }
         } catch (err) {
             alert('Create error: ' + err.message);
@@ -639,9 +670,9 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     async function deleteFileItem(filePath) {
-        if (!confirm(`Are you sure you want to delete ${filePath}?`)) return;
+        if (!confirm('Are you sure you want to delete ' + filePath + '?')) return;
         try {
-            const res = await fetch('/api/file/delete', {
+            var res = await fetch('/api/file/delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ path: filePath })
@@ -650,12 +681,13 @@ HTML_CONTENT = """<!DOCTYPE html>
                 if (activeFilePath === filePath) {
                     activeFilePath = null;
                     document.getElementById('activeFileName').textContent = 'Select a file from sidebar';
-                    document.getElementById('codeEditor').value = '';
-                    document.getElementById('codeEditor').disabled = true;
-                    document.getElementById('saveBtn').disabled = true;
+                    var editor = document.getElementById('codeEditor');
+                    if (editor) { editor.value = ''; editor.disabled = true; }
+                    var saveBtn = document.getElementById('saveBtn');
+                    if (saveBtn) saveBtn.disabled = true;
                 }
-                loadFileList();
-                appendLog(`<span class="log-system">[FILE DELETED] ${escapeHtml(filePath)} deleted.</span>`);
+                await loadFileList();
+                appendLog('<span class="log-system">[FILE DELETED] ' + escapeHtml(filePath) + ' deleted.</span>');
             }
         } catch (err) {
             alert('Delete error: ' + err.message);
@@ -663,100 +695,112 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
 
     function runTemplate(promptText) {
-        document.getElementById('promptInput').value = promptText;
-        submitPrompt();
-    }
-
-    function clearLog() {
-        document.getElementById('terminalLog').innerHTML = '<span class="log-system">[SYSTEM] Terminal log cleared.</span>\n';
-    }
-
-    function appendLog(htmlText) {
-        const log = document.getElementById('terminalLog');
-        log.innerHTML += htmlText + '\n';
-        log.scrollTop = log.scrollHeight;
+        var input = document.getElementById('promptInput');
+        if (input) {
+            input.value = promptText;
+            submitPrompt();
+        }
     }
 
     async function submitPrompt() {
-        const input = document.getElementById('promptInput');
-        const promptText = input.value.trim();
+        var input = document.getElementById('promptInput');
+        if (!input) return;
+        var promptText = input.value.trim();
         if (!promptText) return;
 
-        const btn = document.getElementById('submitBtn');
-        btn.disabled = true;
-        btn.textContent = 'GENERATING...';
+        var btn = document.getElementById('submitBtn');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'GENERATING...';
+        }
 
-        appendLog(`\n<span class="log-prompt">&gt; PROMPT:</span> ${escapeHtml(promptText)}`);
-        appendLog(`<span class="log-system">[AI] Translating prompt to bash command...</span>`);
+        appendLog('\n<span class="log-prompt">&gt; PROMPT:</span> ' + escapeHtml(promptText));
+        appendLog('<span class="log-system">[AI] Translating prompt to bash command...</span>');
 
         try {
-            const res = await fetch('/api/ai-command', {
+            var res = await fetch('/api/ai-command', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ prompt: promptText })
             });
-            const data = await res.json();
+            var data = await res.json();
             
             pendingCommand = data.command || "ls -la";
             pendingExplanation = data.explanation || "Executes inside workshop sandbox.";
 
-            document.getElementById('modalCmd').textContent = pendingCommand;
-            document.getElementById('modalExp').textContent = 'Explanation: ' + pendingExplanation;
-            document.getElementById('confirmModal').style.display = 'flex';
+            var modalCmd = document.getElementById('modalCmd');
+            var modalExp = document.getElementById('modalExp');
+            var modal = document.getElementById('confirmModal');
+
+            if (modalCmd) modalCmd.textContent = pendingCommand;
+            if (modalExp) modalExp.textContent = 'Explanation: ' + pendingExplanation;
+            if (modal) modal.style.display = 'flex';
         } catch (err) {
-            appendLog(`<span class="log-stderr">[ERROR] AI translation failed: ${escapeHtml(String(err))}</span>`);
+            appendLog('<span class="log-stderr">[ERROR] AI translation failed: ' + escapeHtml(String(err)) + '</span>');
         } finally {
-            btn.disabled = false;
-            btn.textContent = 'GENERATE COMMAND';
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'GENERATE COMMAND';
+            }
         }
     }
 
     async function closeModal(approved) {
-        document.getElementById('confirmModal').style.display = 'none';
+        var modal = document.getElementById('confirmModal');
+        if (modal) modal.style.display = 'none';
         
         if (!approved) {
-            appendLog(`<span class="log-system">[CANCELLED] User cancelled command execution.</span>`);
+            appendLog('<span class="log-system">[CANCELLED] User cancelled command execution.</span>');
             return;
         }
 
-        appendLog(`\n<span class="log-cmd">[CONFIRMED] Running command:</span> ${escapeHtml(pendingCommand)}`);
-        appendLog(`<span class="log-exp">[EXPLANATION] ${escapeHtml(pendingExplanation)}</span>`);
+        appendLog('\n<span class="log-cmd">[CONFIRMED] Running command:</span> ' + escapeHtml(pendingCommand));
+        appendLog('<span class="log-exp">[EXPLANATION] ' + escapeHtml(pendingExplanation) + '</span>');
 
         try {
-            const res = await fetch('/api/execute', {
+            var res = await fetch('/api/execute', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ command: pendingCommand, explanation: pendingExplanation })
             });
-            const result = await res.json();
+            var result = await res.json();
 
             if (result.stdout) {
-                appendLog(`<span class="log-stdout">[STDOUT]\n${escapeHtml(result.stdout.trim())}</span>`);
+                appendLog('<span class="log-stdout">[STDOUT]\n' + escapeHtml(result.stdout.trim()) + '</span>');
             }
             if (result.stderr) {
-                appendLog(`<span class="log-stderr">[STDERR]\n${escapeHtml(result.stderr.trim())}</span>`);
+                appendLog('<span class="log-stderr">[STDERR]\n' + escapeHtml(result.stderr.trim()) + '</span>');
             }
-            appendLog(`<span class="log-system">[EXIT CODE] ${result.returncode}</span>`);
+            appendLog('<span class="log-system">[EXIT CODE] ' + result.returncode + '</span>');
         } catch (err) {
-            appendLog(`<span class="log-stderr">[ERROR] Execution failed: ${escapeHtml(String(err))}</span>`);
+            appendLog('<span class="log-stderr">[ERROR] Execution failed: ' + escapeHtml(String(err)) + '</span>');
         }
 
-        document.getElementById('promptInput').value = '';
+        var input = document.getElementById('promptInput');
+        if (input) input.value = '';
         await loadFileList();
 
-        // Refresh current active file if open
         if (activeFilePath) {
             openFile(activeFilePath);
         }
     }
 
-    function escapeHtml(text) {
-        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-    }
-
-    // Initial setup
-    loadFileList();
-    openFile('main.py');
+    // Attach Keydown listener safely
+    window.addEventListener('DOMContentLoaded', function() {
+        var input = document.getElementById('promptInput');
+        if (input) {
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitPrompt();
+                }
+            });
+        }
+        // Initial setup
+        loadFileList().then(function() {
+            openFile('main.py');
+        });
+    });
 </script>
 
 </body>
