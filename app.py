@@ -68,6 +68,43 @@ WEIGHTS = {
                   elevation=.12, surface=.10, simplicity=.02, weather=.04),
 }
 
+# Free-text preferences the model can detect, and which criteria each one boosts.
+# "as safe as possible" boosts safety; "flat" boosts elevation matching at a low
+# ideal; "quiet" boosts noise; and so on. Boosted weights are renormalised so the
+# total still sums to 1.0 — the emphasis changes the ranking, not the scale.
+EMPHASIS = {
+    "safety":    {"safety": 3.4, "simplicity": 1.4},
+    "green":     {"green": 3.2, "noise": 1.4},
+    "quiet":     {"noise": 3.2, "safety": 1.4},
+    "clean_air": {"air": 3.2, "green": 1.3},
+    "flat":      {"elevation": 3.0},
+    "hilly":     {"elevation": 3.0},
+    "smooth":    {"surface": 3.0, "simplicity": 1.5},
+    "simple":    {"simplicity": 3.2},
+    "scenic":    {"green": 2.6, "noise": 1.8, "safety": 1.3},
+    "exact":     {"distance": 2.4},
+}
+EMPHASIS_LABEL = {
+    "safety": "as safe as possible", "green": "green and leafy",
+    "quiet": "quiet, away from traffic", "clean_air": "cleanest air",
+    "flat": "as flat as possible", "hilly": "give me hills",
+    "smooth": "smooth underfoot", "simple": "few turns",
+    "scenic": "scenic", "exact": "exact distance",
+}
+# "flat" and "hilly" also move the target climb rate, not just its weight.
+CLIMB_OVERRIDE = {"flat": 2.0, "hilly": 60.0}
+
+
+def apply_emphasis(weights: dict, emphasis: list[str]) -> dict:
+    """Boost the criteria the user asked for, then renormalise to 1.0."""
+    w = dict(weights)
+    for e in emphasis:
+        for k, mult in EMPHASIS.get(e, {}).items():
+            w[k] = w[k] * mult
+    total = sum(w.values()) or 1.0
+    return {k: v / total for k, v in w.items()}
+
+
 # Preferred climb, metres per kilometre. A runner wants gentle rolling; a hiker
 # came for the hill; a cyclist on a road bike does not.
 IDEAL_CLIMB = {"run": 12.0, "walk": 8.0, "hike": 45.0, "cycle": 10.0}
@@ -153,13 +190,17 @@ def s_surface(extras: dict) -> tuple[float, bool]:
     return (v, True) if v is not None else (75.0, False)
 
 
-def s_elevation(gain_m: float, km: float, activity: str) -> float:
-    """Distance from the activity's ideal climb rate, both directions."""
+def s_elevation(gain_m: float, km: float, activity: str, ideal: float | None = None) -> float:
+    """Distance from the ideal climb rate, both directions.
+
+    The ideal comes from the activity unless the user asked for flat or hilly,
+    in which case CLIMB_OVERRIDE moves it.
+    """
     if km <= 0:
         return 50.0
     rate = gain_m / km
-    ideal = IDEAL_CLIMB.get(activity, 12.0)
-    return 100.0 * math.exp(-abs(rate - ideal) / (ideal * 1.6))
+    ideal = ideal or IDEAL_CLIMB.get(activity, 12.0)
+    return 100.0 * math.exp(-abs(rate - ideal) / (max(2.0, ideal) * 1.6))
 
 
 def s_simplicity(steps: int, km: float) -> float:
@@ -253,20 +294,46 @@ def fetch_weather(lat: float, lon: float) -> dict:
 
 
 def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
-                 n: int = 3) -> list[dict]:
-    """Round trips from OpenRouteService. Different seeds give genuinely different loops."""
+                 emphasis: list[str] | None = None, n: int = 5) -> list[dict]:
+    """Round trips from OpenRouteService. Different seeds give genuinely different loops.
+
+    Preferences change the request itself, not just the ranking afterwards: asking for
+    a safe route makes ORS avoid steps and ferries, and asking for green or quiet
+    switches ORS to its green/quiet profile weighting. Five candidates instead of
+    three, because re-ranking can only pick from what came back.
+    """
     if not ORS_KEY:
         raise RuntimeError("ORS_API_KEY is not set")
+    emphasis = emphasis or []
     profile = ORS_PROFILE.get(activity, "foot-walking")
+
+    avoid = []
+    if "safety" in emphasis or "smooth" in emphasis:
+        avoid = ["steps", "ferries"]
+    elif "flat" in emphasis:
+        avoid = ["steps"]
+
+    # ORS exposes alternative weightings for foot and cycling profiles.
+    if "green" in emphasis or "scenic" in emphasis:
+        pref = "recommended"
+    elif "exact" in emphasis:
+        pref = "shortest"
+    else:
+        pref = "recommended"
+
     out = []
     for i in range(n):
+        opts = {"round_trip": {"length": int(target_m), "points": 3 + i,
+                               "seed": 1 + i * 11}}
+        if avoid:
+            opts["avoid_features"] = avoid
         body = {
             "coordinates": [[lon, lat]],
             "elevation": True,
             "instructions": True,
+            "preference": pref,
             "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
-            "options": {"round_trip": {"length": int(target_m), "points": 4 + i,
-                                       "seed": 1 + i * 7}},
+            "options": opts,
         }
         try:
             r = requests.post(ORS_URL.format(profile=profile), json=body,
@@ -295,9 +362,17 @@ def parse_request(prompt: str) -> dict:
                 {"role": "system", "content":
                  "Extract the exercise request. Reply with JSON only, no prose, no code "
                  'fences: {"distance_value": <number>, "unit": "mi|km|m", '
-                 '"activity": "run|walk|hike|cycle", "notes": "<any preference mentioned, '
-                 'or null>"}. If no distance is stated use 5 and unit "km". Never invent '
-                 "a location."},
+                 '"activity": "run|walk|hike|cycle", '
+                 '"emphasis": [<zero or more of: safety, green, quiet, clean_air, flat, '
+                 'hilly, smooth, simple, scenic, exact>], '
+                 '"notes": "<what they asked for in their own words, or null>"}. '
+                 "Map their wording onto the emphasis list: 'as safe as possible' -> "
+                 "safety; 'avoid traffic', 'quiet' -> quiet; 'parks', 'trees', 'nature' "
+                 "-> green; 'flat', 'no hills' -> flat; 'hilly', 'hill training' -> "
+                 "hilly; 'clean air', 'asthma' -> clean_air; 'even ground', 'paved' -> "
+                 "smooth; 'no turns', 'simple' -> simple; 'pretty', 'scenic' -> scenic; "
+                 "'exactly' -> exact. Return an empty list if they stated no preference. "
+                 'If no distance is stated use 5 and unit "km". Never invent a location.'},
                 {"role": "user", "content": prompt[:600]}])
         txt = (r.choices[0].message.content or "").strip().strip("`")
         txt = re.sub(r"^json", "", txt, flags=re.I).strip()
@@ -310,9 +385,12 @@ def parse_request(prompt: str) -> dict:
         act = str(got.get("activity", "run")).lower()
         if act not in WEIGHTS:
             act = "run"
+        emph = [e for e in (got.get("emphasis") or []) if e in EMPHASIS][:4]
+        if not emph:
+            emph = fallback["emphasis"]        # keyword safety net
         return {"target_m": max(400.0, min(50000.0, metres)), "activity": act,
                 "notes": got.get("notes"), "parsed_by": PARSE_MODEL,
-                "stated": f"{val} {unit}"}
+                "emphasis": emph, "stated": f"{val} {unit}"}
     except Exception:
         return fallback
 
@@ -325,8 +403,24 @@ def _regex_parse(prompt: str) -> dict:
                     1.0 if unit.strip() == "m" else 1000.0)
     act = ("hike" if "hik" in p else "cycle" if any(x in p for x in ("cycl", "bike", "ride"))
            else "walk" if "walk" in p else "run")
+    # Keyword safety net, so a preference is never silently dropped even if the
+    # model is unavailable or returns nothing useful.
+    kw = {
+        "safety": ("safe", "safest", "safety", "dangerous", "traffic-free", "sidewalk"),
+        "quiet": ("quiet", "peaceful", "away from traffic", "no cars", "calm"),
+        "green": ("green", "park", "trees", "nature", "leafy", "trail", "woods"),
+        "clean_air": ("clean air", "air quality", "pollution", "asthma", "smog"),
+        "flat": ("flat", "no hills", "nothing steep", "level"),
+        "hilly": ("hilly", "hills", "climb", "elevation", "steep"),
+        "smooth": ("smooth", "paved", "even ground", "no gravel", "pavement"),
+        "simple": ("simple", "few turns", "no turns", "straightforward", "easy to follow"),
+        "scenic": ("scenic", "pretty", "beautiful", "views", "nice"),
+        "exact": ("exactly", "precisely", "exact"),
+    }
+    emph = [k for k, words in kw.items() if any(x in p for x in words)][:4]
     return {"target_m": max(400.0, min(50000.0, metres)), "activity": act,
-            "notes": None, "parsed_by": "regex fallback", "stated": f"{val} {unit}"}
+            "notes": None, "parsed_by": "keyword fallback", "emphasis": emph,
+            "stated": f"{val} {unit}"}
 
 
 def write_summary(best: dict, ctx: dict) -> str:
@@ -368,7 +462,8 @@ def write_summary(best: dict, ctx: dict) -> str:
 # ────────────────────────────────────────────────────────────── scoring a route
 
 def score_route(feature_collection: dict, target_m: float, activity: str,
-                air: dict, weather: dict, idx: int) -> dict | None:
+                air: dict, weather: dict, idx: int, weights: dict | None = None,
+                climb_ideal: float | None = None, start=None) -> dict | None:
     feats = feature_collection.get("features") or []
     if not feats:
         return None
@@ -394,12 +489,12 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
         "green": green,
         "noise": noise,
         "safety": safety,
-        "elevation": s_elevation(ascent, km, activity),
+        "elevation": s_elevation(ascent, km, activity, climb_ideal),
         "surface": surface,
         "simplicity": s_simplicity(steps, km),
         "weather": s_weather(weather, activity),
     }
-    w = WEIGHTS.get(activity, WEIGHTS["run"])
+    w = weights or WEIGHTS.get(activity, WEIGHTS["run"])
     total = sum(w[k] * sc[k] for k in w)
 
     pace = {"run": 6.2, "walk": 12.5, "hike": 15.0, "cycle": 3.2}.get(activity, 6.2)
@@ -420,6 +515,29 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
                       "safety": not safety_real, "surface": not surface_real},
         "geojson": f,
     }
+
+
+def google_maps_url(coords: list, activity: str) -> str:
+    """A turn-by-turn link the user can open in Google Maps.
+
+    Google's URL scheme takes an origin, a destination and up to nine waypoints, so
+    we sample the loop evenly. It is the same loop, walkable turn by turn on a phone.
+    """
+    if not coords or len(coords) < 2:
+        return ""
+    pts = [(c[1], c[0]) for c in coords]          # GeoJSON is [lon, lat]
+    start = pts[0]
+    body = pts[1:-1]
+    k = min(8, len(body))
+    step = max(1, len(body) // k) if k else 1
+    way = body[::step][:8]
+    mode = {"cycle": "bicycling"}.get(activity, "walking")
+    fmt = lambda p: f"{p[0]:.5f},{p[1]:.5f}"
+    url = ("https://www.google.com/maps/dir/?api=1"
+           f"&origin={fmt(start)}&destination={fmt(start)}&travelmode={mode}")
+    if way:
+        url += "&waypoints=" + "|".join(fmt(p) for p in way)
+    return url
 
 
 # ────────────────────────────────────────────────────────────── API
@@ -484,11 +602,17 @@ def plan_route(req: PlanRequest):
         return {"error": "Those coordinates are not on Earth. Check latitude and longitude."}
 
     parsed = parse_request(req.prompt)
+    emphasis = parsed.get("emphasis") or []
+    base_w = WEIGHTS.get(parsed["activity"], WEIGHTS["run"])
+    weights = apply_emphasis(base_w, emphasis)
+    climb_ideal = next((CLIMB_OVERRIDE[e] for e in emphasis if e in CLIMB_OVERRIDE), None)
+
     air = fetch_air(req.lat, req.lon)
     weather = fetch_weather(req.lat, req.lon)
 
     try:
-        raw = fetch_routes(req.lat, req.lon, parsed["target_m"], parsed["activity"])
+        raw = fetch_routes(req.lat, req.lon, parsed["target_m"], parsed["activity"],
+                           emphasis)
     except RuntimeError as e:
         return {"error": str(e)}
 
@@ -497,8 +621,12 @@ def plan_route(req: PlanRequest):
         if "error" in fc:
             errors.append(fc["error"])
             continue
-        s = score_route(fc, parsed["target_m"], parsed["activity"], air, weather, i + 1)
+        s = score_route(fc, parsed["target_m"], parsed["activity"], air, weather, i + 1,
+                        weights, climb_ideal)
         if s:
+            s["google_maps_url"] = google_maps_url(
+                s["geojson"].get("geometry", {}).get("coordinates", []),
+                parsed["activity"])
             routes.append(s)
     if not routes:
         return {"error": "OpenRouteService returned no usable loops here. Try a different "
@@ -508,6 +636,15 @@ def plan_route(req: PlanRequest):
     routes.sort(key=lambda r: -r["score"])
     for rank, r in enumerate(routes, 1):
         r["rank"] = rank
+    # drop near-duplicate loops so the list shows genuinely different options
+    seen, unique = set(), []
+    for r in routes:
+        sig = (round(r["distance_m"] / 120), round(r["elevation_gain_m"] / 12))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(r)
+    routes = unique[:4]
 
     ctx = {**parsed, "air": air, "weather": weather}
     summary = write_summary(routes[0], ctx)
@@ -516,7 +653,11 @@ def plan_route(req: PlanRequest):
         "request": {"target_m": round(parsed["target_m"]),
                     "target_mi": round(parsed["target_m"] / 1609.34, 2),
                     "activity": parsed["activity"], "stated": parsed["stated"],
-                    "notes": parsed.get("notes"), "parsed_by": parsed["parsed_by"]},
+                    "notes": parsed.get("notes"), "parsed_by": parsed["parsed_by"],
+                    "emphasis": emphasis,
+                    "emphasis_labels": [EMPHASIS_LABEL.get(e, e) for e in emphasis]},
+        "weights": {"base": base_w, "applied": {k: round(v, 3) for k, v in weights.items()},
+                    "changed": sorted({k for e in emphasis for k in EMPHASIS.get(e, {})})},
         "air": air,
         "weather": weather,
         "summary": summary,
@@ -619,6 +760,16 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
 .crit .est{color:var(--warn)}
 .note{font-size:10.5px;color:var(--dim);line-height:1.5;margin-top:9px}
 
+.prefs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.pref{background:#2A5348;border:1px solid var(--blaze);color:#FFD9C6;border-radius:20px;
+  padding:4px 11px;font-size:11.5px;font-weight:500}
+.pref.none{background:#1D3B34;border-color:var(--line);color:var(--dim)}
+.boosted{color:var(--blaze) !important;font-weight:600}
+.nav{display:block;text-align:center;background:#2A5348;border:1px solid var(--blaze);
+  color:#FFD9C6;text-decoration:none;border-radius:3px;padding:9px;margin-top:10px;
+  font-family:var(--d);font-weight:600;font-size:13px;letter-spacing:.1em;
+  text-transform:uppercase}
+.nav:hover{background:var(--blaze);color:#1A0B04}
 .err{background:#3A1C10;border-left:3px solid var(--blaze);padding:12px 14px;font-size:13px;
   line-height:1.55}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);
@@ -647,12 +798,12 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
 
   <div class="row">
     <label for="prompt">What do you want to do</label>
-    <textarea id="prompt">I want to run about 5 miles somewhere green and quiet.</textarea>
+    <textarea id="prompt">I want to run about 5 km, as safe as possible.</textarea>
     <div class="chips">
       <button class="chip">5k easy run</button>
-      <button class="chip">3 mile walk, flat</button>
-      <button class="chip">10 km hilly hike</button>
-      <button class="chip">15 km bike ride</button>
+      <button class="chip">3 mile walk, as flat as possible</button>
+      <button class="chip">10 km hike, hilly and green</button>
+      <button class="chip">15 km bike ride, quiet roads</button>
     </div>
   </div>
 
@@ -734,15 +885,18 @@ function select(i) {
   draw(i);
 }
 
+let BOOSTED = [];
 function critRow(key, val, weight, estimated) {
   const cls = val >= 75 ? 'hi' : val < 45 ? 'lo' : '';
-  return `<div class="crit"><span class="${estimated?'est':''}">${esc(LABELS[key]||key)}${estimated?' *':''}</span>
+  const up = BOOSTED.includes(key) ? ' boosted' : '';
+  return `<div class="crit"><span class="${estimated?'est':''}${up}">${esc(LABELS[key]||key)}${up?' \u2191':''}${estimated?' *':''}</span>
     <span class="track"><i class="${cls}" style="width:${Math.max(2,val)}%"></i></span>
     <span class="v">${Math.round(val)}</span></div>`;
 }
 
 function render(d) {
   DATA = d;
+  BOOSTED = (d.weights && d.weights.changed) || [];
   const w = d.weather || {}, a = d.air || {};
   const est = [];
   $('#out').innerHTML = `
@@ -752,13 +906,20 @@ function render(d) {
       <div><b>${d.request.target_mi}</b><small>target mi</small></div>
       <div><b>${esc(d.request.activity)}</b><small>activity</small></div>
     </div>
+    <label>What I understood</label>
+    <div class="prefs">${
+      (d.request.emphasis_labels && d.request.emphasis_labels.length)
+        ? d.request.emphasis_labels.map(x => `<span class="pref">${esc(x)}</span>`).join('')
+        : '<span class="pref none">no preference stated — using the default balance for ' +
+          esc(d.request.activity) + '</span>'}</div>
     <div class="summary"><div class="tagline">Recommendation</div>${esc(d.summary)}</div>
     <label>Candidate loops</label>
     <div id="cands"></div>
     <p class="note">Air data: ${esc(a.source||'—')}. Distance parsed by ${esc(d.request.parsed_by)}.
       Scores are computed in Python from routing, elevation, air and weather data —
       the model reads your request and writes the summary, and never produces a number.
-      An asterisk marks a criterion OpenRouteService did not supply for this route,
+      An arrow marks a criterion you asked me to prioritise, which was weighted up before
+      ranking. An asterisk marks a criterion OpenRouteService did not supply for this route,
       where a documented baseline was used instead.</p>`;
 
   $('#cands').innerHTML = d.routes.map((r, i) => `
@@ -772,11 +933,16 @@ function render(d) {
       <div class="breakdown">
         ${Object.keys(r.scores).map(k => critRow(k, r.scores[k], r.weights[k],
             r.estimated[k])).join('')}
+        ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
+          target="_blank" rel="noopener">Navigate in Google Maps</a>` : ''}
       </div>
     </button>`).join('');
 
   document.querySelectorAll('.cand').forEach(el =>
-    el.addEventListener('click', () => select(+el.dataset.i)));
+    el.addEventListener('click', e => {
+      if (e.target.closest('.nav')) return;   // let the Google Maps link through
+      select(+el.dataset.i);
+    }));
 
   draw(0);
   placeStart(...d.routes[0].geojson.geometry.coordinates[0].slice(0,2).reverse());
