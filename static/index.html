@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nearmiss — rising risk in aviation near-miss reports</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --board:#2B2F33; --bay:#3A4046; --rail:#4C545B;
+  --paper:#F2EFE6; --paper-data:#CFDDE6; --paper-alert:#F0D2CE; --paper-verify:#F0DFB8;
+  --ink:#1A1D1F; --ink-dim:#5C6469; --chalk:#C9CFD3; --chalk-dim:#858E95;
+  --alert:#B4451F; --ok:#3F6B4C;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+  --sans:"IBM Plex Sans",system-ui,sans-serif;
+  --display:"Archivo",system-ui,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--board);color:var(--chalk);font-family:var(--mono);font-size:14px}
+a{color:inherit}
+
+/* ---- masthead ------------------------------------------------------- */
+header{border-bottom:1px solid var(--rail);padding:14px 20px;display:flex;
+  align-items:baseline;gap:18px;flex-wrap:wrap}
+h1{font-family:var(--display);font-weight:800;font-size:26px;letter-spacing:-.02em;
+  margin:0;color:#fff;text-transform:uppercase}
+.tag{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--chalk-dim)}
+#health{margin-left:auto;font-size:11px;color:var(--chalk-dim);letter-spacing:.06em}
+#health b{color:var(--chalk);font-weight:600}
+
+/* ---- layout --------------------------------------------------------- */
+main{display:grid;grid-template-columns:300px 1fr;min-height:calc(100vh - 58px)}
+aside{border-right:1px solid var(--rail);padding:20px;background:#262A2E}
+section{padding:20px 24px;background:
+  repeating-linear-gradient(180deg,var(--board) 0 46px,#2F343800 46px 47px)}
+
+label.lbl{display:block;font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--chalk-dim);margin:0 0 8px}
+textarea{width:100%;height:82px;resize:vertical;background:#1E2225;color:var(--chalk);
+  border:1px solid var(--rail);border-radius:2px;padding:10px;font-family:var(--mono);font-size:13px}
+textarea:focus,button:focus-visible,.preset:focus-visible{outline:2px solid var(--paper-data);outline-offset:2px}
+button.go{margin-top:10px;width:100%;background:var(--paper);color:var(--ink);border:0;
+  border-radius:2px;padding:11px;font-family:var(--display);font-weight:800;font-size:13px;
+  letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
+button.go:disabled{opacity:.45;cursor:not-allowed}
+.preset{display:block;width:100%;text-align:left;background:transparent;color:var(--chalk);
+  border:1px solid var(--rail);border-radius:2px;padding:9px 10px;margin-bottom:7px;
+  font-family:var(--mono);font-size:12px;cursor:pointer;line-height:1.35}
+.preset:hover{border-color:var(--paper-data);color:#fff}
+.divider{height:1px;background:var(--rail);margin:22px 0}
+
+/* ---- the strip bay: the signature element --------------------------- */
+.bayhead{display:flex;align-items:baseline;gap:12px;margin-bottom:14px}
+.bayhead h2{font-family:var(--display);font-weight:600;font-size:12px;letter-spacing:.18em;
+  text-transform:uppercase;color:var(--chalk-dim);margin:0}
+.legend{margin-left:auto;display:flex;gap:14px;font-size:10px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--chalk-dim);flex-wrap:wrap}
+.swatch{display:inline-block;width:9px;height:9px;margin-right:5px;vertical-align:baseline}
+
+.strip{background:var(--paper);color:var(--ink);border-left:7px solid var(--ink);
+  margin-bottom:6px;padding:8px 12px;display:grid;
+  grid-template-columns:34px 1fr auto;gap:12px;align-items:start;
+  box-shadow:0 1px 0 rgba(0,0,0,.5);animation:slot .22s ease-out}
+@keyframes slot{from{transform:translateX(-14px);opacity:0}to{transform:none;opacity:1}}
+@media(prefers-reduced-motion:reduce){.strip{animation:none}}
+.strip.data{background:var(--paper-data);border-left-color:#31576E}
+.strip.verify{background:var(--paper-verify);border-left-color:#8A6A1E}
+.strip.alert{background:var(--paper-alert);border-left-color:var(--alert)}
+.slot{font-family:var(--display);font-weight:800;font-size:15px;color:var(--ink-dim)}
+.fn{font-weight:600;font-size:13px;letter-spacing:.01em}
+.args{font-size:11.5px;color:var(--ink-dim);margin-top:2px;word-break:break-word}
+.res{font-size:11.5px;margin-top:5px;line-height:1.45}
+.res b{font-weight:600}
+.prov{font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim);
+  text-align:right;white-space:nowrap}
+
+/* ---- trend chart ---------------------------------------------------- */
+.chart{margin-top:8px;background:#ffffff88;padding:8px}
+.chart svg{display:block;width:100%;height:74px}
+
+/* ---- finding -------------------------------------------------------- */
+.finding{margin-top:22px;border:1px solid var(--rail);border-top:3px solid var(--paper);
+  padding:20px 22px;background:#22262A}
+.finding h3{font-family:var(--display);font-weight:800;font-size:13px;letter-spacing:.16em;
+  text-transform:uppercase;margin:0 0 12px;color:#fff}
+.finding p{font-family:var(--sans);font-size:14.5px;line-height:1.6;color:#E4E8EA;margin:0 0 11px;
+  white-space:pre-wrap}
+.meta{margin-top:14px;padding-top:12px;border-top:1px solid var(--rail);
+  font-size:11px;letter-spacing:.06em;color:var(--chalk-dim)}
+.empty{color:var(--chalk-dim);font-size:12.5px;line-height:1.7;max-width:56ch}
+.err{background:var(--paper-alert);color:#5C1E0C;padding:10px 12px;font-size:12.5px}
+footer{padding:14px 24px;border-top:1px solid var(--rail);font-size:10.5px;
+  color:var(--chalk-dim);letter-spacing:.05em;line-height:1.6}
+@media(max-width:820px){main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--rail)}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Nearmiss</h1>
+  <span class="tag">rising-risk detection in aviation near-miss narratives</span>
+  <div id="health">checking corpus…</div>
+</header>
+
+<main>
+<aside>
+  <label class="lbl" for="q">Ask the analyst</label>
+  <textarea id="q" placeholder="Is anything getting worse at SFO?"></textarea>
+  <button class="go" id="go">Investigate</button>
+
+  <div class="divider"></div>
+  <label class="lbl">Start here</label>
+  <div id="presets"></div>
+
+  <div class="divider"></div>
+  <label class="lbl">Fields on file</label>
+  <div id="airports" class="empty">loading…</div>
+</aside>
+
+<section>
+  <div class="bayhead">
+    <h2>Investigation bay</h2>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--paper-data)"></i>computed in python</span>
+      <span><i class="swatch" style="background:var(--paper)"></i>model read</span>
+      <span><i class="swatch" style="background:var(--paper-verify)"></i>independent check</span>
+    </div>
+  </div>
+  <div id="bay">
+    <p class="empty">The analyst works by filing a strip for every step it takes. Each strip shows
+    the tool it called, what it asked for, and what came back. Blue strips are arithmetic done in
+    Python against the report database — no language model produces a number in this system.</p>
+  </div>
+  <div id="out"></div>
+</section>
+</main>
+
+<footer>
+  Narratives are confidential voluntary safety reports. Counts, rates and p-values are computed
+  from the database in Python; models read text, name patterns and write prose.
+  This is a hackathon prototype, not an airworthiness or operational safety tool.
+</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const bay = $('#bay'), out = $('#out'), goBtn = $('#go'), qBox = $('#q');
+const PURE_PYTHON = new Set(['compute_trend','compare_baseline','backtest_asof','cluster_incidents','search_reports','get_airport_context']);
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+const PRESETS = [
+  'Is anything getting worse at SFO?',
+  'Compare hot brakes reports at BOS against every other field.',
+  'What is the single most concerning rising pattern in the corpus right now, and is it local?',
+  'Was the BOS brake-temperature pattern detectable before May 2024?'
+];
+
+fetch('/api/health').then(r => r.json()).then(h => {
+  const bad = Object.entries(h.models || {}).filter(([, v]) => v !== true).map(([k]) => k);
+  $('#health').innerHTML =
+    `<b>${h.reports.toLocaleString()}</b> reports &nbsp;·&nbsp; ${h.span[0]}–${h.span[1]}` +
+    (h.featherless_catalog_size ? ` &nbsp;·&nbsp; <b>${h.featherless_catalog_size.toLocaleString()}</b> models reachable` : '') +
+    (bad.length ? ` &nbsp;·&nbsp; <span style="color:#F0D2CE">unavailable: ${bad.join(', ')}</span>` : '');
+}).catch(() => $('#health').textContent = 'health check failed');
+
+fetch('/api/airports').then(r => r.json()).then(rows => {
+  $('#airports').innerHTML = rows.map(a =>
+    `<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:12px">
+       <span>${esc(a.icao)} <span style="color:var(--chalk-dim)">${esc(a.name || '')}</span></span>
+       <span style="color:var(--chalk-dim)">${a.n}</span></div>`).join('');
+}).catch(() => $('#airports').textContent = 'unavailable');
+
+$('#presets').innerHTML = PRESETS.map((p, i) =>
+  `<button class="preset" data-i="${i}">${esc(p)}</button>`).join('');
+$('#presets').addEventListener('click', e => {
+  const b = e.target.closest('.preset'); if (!b) return;
+  qBox.value = PRESETS[+b.dataset.i]; ask();
+});
+
+function strip(cls, slot, fn, args, prov) {
+  const el = document.createElement('div');
+  el.className = 'strip ' + cls;
+  el.innerHTML = `<div class="slot">${String(slot).padStart(2,'0')}</div>
+    <div><div class="fn">${esc(fn)}</div>
+    <div class="args">${esc(args)}</div><div class="res"></div></div>
+    <div class="prov">${esc(prov)}</div>`;
+  bay.appendChild(el);
+  el.scrollIntoView({block:'nearest', behavior:'smooth'});
+  return el;
+}
+
+function sparkline(counts) {
+  const keys = Object.keys(counts), vals = keys.map(k => counts[k]);
+  const max = Math.max(1, ...vals), w = 100 / keys.length;
+  const bars = vals.map((v, i) => {
+    const h = (v / max) * 100, late = i >= keys.length - 6;
+    return `<rect x="${i*w+0.6}%" y="${100-h}%" width="${w-1.2}%" height="${h}%"
+      fill="${late ? '#B4451F' : '#31576E'}"></rect>`;
+  }).join('');
+  return `<div class="chart"><svg viewBox="0 0 100 100" preserveAspectRatio="none">${bars}</svg>
+    <div style="display:flex;justify-content:space-between;font-size:9.5px;color:#5C6469;margin-top:3px">
+    <span>${esc(keys[0])}</span><span>last 6 months in red</span><span>${esc(keys.at(-1))}</span></div></div>`;
+}
+
+function summarise(name, r) {
+  if (r.error) return `<b style="color:#8C2E12">${esc(r.error)}</b>`;
+  if (name === 'compute_trend' || name === 'backtest_asof') {
+    const sig = r['significant_at_0.01'];
+    return `<b>${r.recent_reports}</b> reports in the last ${r.recent_months} months ·
+      recent rate <b>${r.recent_rate_per_month}/mo</b> vs baseline <b>${r.baseline_rate_per_month}/mo</b> ·
+      ratio <b>${r.rate_ratio ?? '—'}×</b> · p=<b>${r.p_value}</b>
+      ${sig ? '<b style="color:#8C2E12"> — significant</b>' : ' — not significant'}
+      ${r.would_have_flagged !== undefined ? `<br>as of ${esc(r.cutoff_ym)}, using data through ${esc(r.data_used_through)}: <b>${r.would_have_flagged ? 'WOULD have flagged' : 'would not have flagged'}</b>` : ''}
+      ${r.monthly_counts ? sparkline(r.monthly_counts) : ''}`;
+  }
+  if (name === 'compare_baseline')
+    return `target <b>${r.target.rate_ratio ?? '—'}×</b> · peer median <b>${r.peer_median_rate_ratio ?? '—'}×</b><br>
+      ${r.peers.slice(0,5).map(p => `${esc(p.airport)} ${p.rate_ratio ?? '—'}×`).join(' · ')}`;
+  if (name === 'cluster_incidents')
+    return r.clusters.slice(0,6).map(c => `<b>${esc(c.cluster_id)}</b> ${esc(c.label||'')} (${c.n})`).join('<br>');
+  if (name === 'search_reports')
+    return `<b>${r.n}</b> matched · ` + r.reports.slice(0,3).map(x => esc(x.report_id)).join(', ');
+  if (name === 'verify_finding')
+    return `verdict <b>${esc(r.verdict||'?')}</b> — ${esc(r.reason||'')}`;
+  if (name === 'extract_causal_chain' && r.chain)
+    return Object.entries(r.chain).map(([k,v]) =>
+      `<b>${esc(k)}</b>: ${esc(Array.isArray(v)?v.join('; '):(v??'—'))}`).join('<br>');
+  if (name === 'get_airport_context')
+    return `${esc(r.name||r.icao)} · ${esc(r.runways||'')}<br>${esc(r.notes||'')}`;
+  return esc(JSON.stringify(r).slice(0, 260));
+}
+
+let source = null, open = {};
+
+function ask() {
+  const q = qBox.value.trim();
+  if (!q) return;
+  if (source) source.close();
+  bay.innerHTML = ''; out.innerHTML = ''; open = {};
+  goBtn.disabled = true; goBtn.textContent = 'Investigating…';
+
+  source = new EventSource('/api/ask?q=' + encodeURIComponent(q));
+
+  source.addEventListener('tool_call', e => {
+    const d = JSON.parse(e.data);
+    const cls = d.name === 'verify_finding' ? 'verify' : PURE_PYTHON.has(d.name) ? 'data' : '';
+    const prov = d.name === 'verify_finding' ? 'independent model'
+               : PURE_PYTHON.has(d.name) ? 'python · no model' : 'model read';
+    const args = Object.entries(d.args).map(([k,v]) => `${k}=${v}`).join('  ') || '(no arguments)';
+    open[d.name + d.step] = strip(cls, d.step, d.name, args, prov);
+  });
+
+  source.addEventListener('tool_result', e => {
+    const d = JSON.parse(e.data);
+    const el = open[d.name + d.step]; if (!el) return;
+    el.querySelector('.res').innerHTML = summarise(d.name, d.result);
+    if (d.result && d.result['significant_at_0.01']) el.classList.add('alert');
+  });
+
+  source.addEventListener('answer', e => {
+    const d = JSON.parse(e.data);
+    out.innerHTML = `<div class="finding"><h3>Finding</h3><p>${esc(d.text)}</p>
+      <div class="meta">${d.steps} tool calls · ${d.seconds}s · every quantity above traces to a Python computation</div></div>`;
+  });
+
+  source.addEventListener('error', e => {
+    try { out.innerHTML = `<div class="err">${esc(JSON.parse(e.data).message)}</div>`; } catch {}
+  });
+
+  source.addEventListener('done', () => {
+    source.close(); goBtn.disabled = false; goBtn.textContent = 'Investigate';
+  });
+
+  source.onerror = () => {
+    goBtn.disabled = false; goBtn.textContent = 'Investigate';
+    if (!out.innerHTML) out.innerHTML = '<div class="err">Connection dropped. If this is a fresh Render deploy, the service was probably cold — try once more.</div>';
+    source.close();
+  };
+}
+
+goBtn.addEventListener('click', ask);
+qBox.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ask(); });
+</script>
+</body>
+</html>
+
