@@ -19,7 +19,6 @@ WORKSHOP_DIR = os.path.join(BASE_DIR, "workshop")
 os.makedirs(WORKSHOP_DIR, exist_ok=True)
 
 def safe_path(rel_path: str) -> str:
-    """Ensures paths remain strictly inside WORKSHOP_DIR."""
     rel_path = rel_path.lstrip("/\\")
     full_path = os.path.abspath(os.path.join(WORKSHOP_DIR, rel_path))
     if not full_path.startswith(WORKSHOP_DIR):
@@ -30,17 +29,16 @@ def seed_demo_files():
     main_py = os.path.join(WORKSHOP_DIR, "main.py")
     if not os.path.exists(main_py):
         with open(main_py, "w", encoding="utf-8") as f:
-            f.write('# AI Code Editor Sandbox\n\ndef hello():\n    print("Hello from main.py!")\n\nif __name__ == "__main__":\n    hello()\n')
+            f.write('# AI Code Editor Sandbox\n\ndef main():\n    print("Hello from main.py!")\n    print("1 + 1 =", 1 + 1)\n\nif __name__ == "__main__":\n    main()\n')
     readme_md = os.path.join(WORKSHOP_DIR, "README.md")
     if not os.path.exists(readme_md):
         with open(readme_md, "w", encoding="utf-8") as f:
-            f.write('# Workshop Project\nClick any file in the sidebar to view and edit code in real-time.\nUse the prompt bar below to run AI terminal commands.\n')
+            f.write('# Workshop Sandbox\n\nEdit code in the editor above, click [RUN FILE], or type commands below.\n')
 
 seed_demo_files()
 
-app = FastAPI(title="AI Code Editor & Terminal Sandbox")
+app = FastAPI(title="AI Code Editor & Direct Terminal Sandbox")
 
-# Enable CORS for all origins to prevent browser fetch blocks
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,13 +47,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Models
 class PromptRequest(BaseModel):
     prompt: str
 
 class ExecuteRequest(BaseModel):
     command: str
-    explanation: Optional[str] = ""
 
 class SaveFileRequest(BaseModel):
     path: str
@@ -68,11 +64,10 @@ class DeleteFileRequest(BaseModel):
     path: str
 
 # -----------------------------------------------------------------------------
-# 2. File Operations API (Real Code Editing & File Management)
+# 2. File Operations API
 # -----------------------------------------------------------------------------
 @app.get("/api/files")
 def list_files():
-    """Lists all files and directories in ./workshop."""
     items = []
     for root, dirs, files in os.walk(WORKSHOP_DIR):
         rel_root = os.path.relpath(root, WORKSHOP_DIR)
@@ -86,7 +81,6 @@ def list_files():
 
 @app.get("/api/file/content")
 def get_file_content(path: str = Query(...)):
-    """Reads raw content of a file inside ./workshop."""
     target = safe_path(path)
     if not os.path.exists(target) or os.path.isdir(target):
         raise HTTPException(status_code=404, detail="File not found")
@@ -99,7 +93,6 @@ def get_file_content(path: str = Query(...)):
 
 @app.post("/api/file/save")
 def save_file(req: SaveFileRequest):
-    """Saves updated file content back to disk inside ./workshop."""
     target = safe_path(req.path)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     try:
@@ -111,7 +104,6 @@ def save_file(req: SaveFileRequest):
 
 @app.post("/api/file/create")
 def create_file(req: CreateFileRequest):
-    """Creates a new empty file inside ./workshop."""
     target = safe_path(req.path)
     if os.path.exists(target):
         raise HTTPException(status_code=400, detail="File already exists")
@@ -125,7 +117,6 @@ def create_file(req: CreateFileRequest):
 
 @app.post("/api/file/delete")
 def delete_file(req: DeleteFileRequest):
-    """Deletes a file from ./workshop."""
     target = safe_path(req.path)
     if not os.path.exists(target):
         raise HTTPException(status_code=404, detail="File not found")
@@ -140,19 +131,19 @@ def delete_file(req: DeleteFileRequest):
         raise HTTPException(status_code=500, detail=str(err))
 
 # -----------------------------------------------------------------------------
-# 3. AI Command Translation & Execution Engine
+# 3. AI & Command Execution Engine
 # -----------------------------------------------------------------------------
 def local_fallback_command(prompt: str) -> dict:
     p = prompt.lower().strip()
     if "run" in p and ("python" in p or ".py" in p or "main" in p):
         match = re.search(r'([a-zA-Z0-9_\-]+\.py)', prompt)
         fname = match.group(1) if match else "main.py"
-        return {"command": f"python3 {fname}", "explanation": f"Executes Python script '{fname}' in terminal."}
+        return {"command": f"python3 {fname}", "explanation": f"Executes Python script '{fname}'."}
     elif "create" in p or "make" in p or "touch" in p:
         if "folder" in p or "directory" in p or "mkdir" in p:
             match = re.search(r'(?:folder|directory|named|called)\s+([a-zA-Z0-9_\-]+)', p)
             dirname = match.group(1) if match else "data"
-            return {"command": f"mkdir -p {dirname}", "explanation": f"Creates directory '{dirname}' inside workshop."}
+            return {"command": f"mkdir -p {dirname}", "explanation": f"Creates directory '{dirname}'."}
         else:
             match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
             filename = match.group(1) if match else "app.py"
@@ -160,19 +151,21 @@ def local_fallback_command(prompt: str) -> dict:
                 cmd = f"echo 'print(\"Hello from {filename}!\")' > {filename}"
             else:
                 cmd = f"echo 'Sample content' > {filename}"
-            return {"command": cmd, "explanation": f"Creates file '{filename}' inside workshop."}
+            return {"command": cmd, "explanation": f"Creates file '{filename}'."}
     elif "list" in p or "ls" in p or "show files" in p:
-        return {"command": "ls -la", "explanation": "Lists all files in workshop with permissions and sizes."}
+        return {"command": "ls -la", "explanation": "Lists all files in workshop."}
     elif "find" in p or "python" in p:
-        return {"command": "find . -name '*.py'", "explanation": "Finds all Python files inside workshop."}
+        return {"command": "find . -name '*.py'", "explanation": "Finds all Python files."}
     elif "disk" in p or "space" in p or "usage" in p:
         return {"command": "du -sh *", "explanation": "Displays disk space used by workshop files."}
     elif "read" in p or "cat" in p or "open" in p:
         match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
         filename = match.group(1) if match else "main.py"
-        return {"command": f"cat {filename}", "explanation": f"Prints content of '{filename}' to terminal."}
+        return {"command": f"cat {filename}", "explanation": f"Prints content of '{filename}'."}
+    elif "1+1" in p or "calc" in p or "math" in p or "python -c" in p:
+        return {"command": "python3 -c 'print(1 + 1)'", "explanation": "Calculates 1 + 1 using Python."}
     else:
-        return {"command": f"echo 'Executed prompt: {prompt}'", "explanation": f"Processes request '{prompt}' inside workshop."}
+        return {"command": f"echo 'Prompt: {prompt}'", "explanation": f"Processes request '{prompt}'."}
 
 @app.post("/api/ai-command")
 def generate_command(req: PromptRequest):
@@ -235,7 +228,7 @@ def execute_command(req: ExecuteRequest):
         return {"command": cmd, "stdout": "", "stderr": f"Error: {str(err)}", "returncode": 1}
 
 # -----------------------------------------------------------------------------
-# 4. Ultra-Robust Web Application Frontend
+# 4. Instant Interactive Web Frontend
 # -----------------------------------------------------------------------------
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -274,7 +267,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         .main-layout { display: flex; flex: 1; overflow: hidden; }
 
         .sidebar {
-            width: 260px;
+            width: 270px;
             background-color: #252526;
             border-right: 1px solid #333333;
             display: flex;
@@ -305,7 +298,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
         .action-btn-sm:hover { background: #3e3e42; color: #ffffff; }
 
-        .file-list { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
+        .file-list { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
         .file-item {
             display: flex;
             align-items: center;
@@ -318,6 +311,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             background-color: #1e1e1e;
             border: 1px solid #333333;
             user-select: none;
+            transition: all 0.15s ease;
         }
         .file-item:hover { background-color: #0e639c; color: #ffffff; border-color: #1177bb; }
         .file-item.active { background-color: #0e639c; color: #ffffff; font-weight: bold; border-color: #007acc; }
@@ -341,13 +335,13 @@ HTML_CONTENT = """<!DOCTYPE html>
         .content-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; background-color: #1e1e1e; }
         
         .editor-pane {
-            height: 55%;
+            height: 52%;
             display: flex;
             flex-direction: column;
             border-bottom: 1px solid #333333;
         }
         .editor-toolbar {
-            height: 36px;
+            height: 38px;
             background-color: #2d2d2d;
             border-bottom: 1px solid #333333;
             display: flex;
@@ -357,6 +351,19 @@ HTML_CONTENT = """<!DOCTYPE html>
             font-size: 12px;
         }
         .active-file-label { color: #569cd6; font-weight: bold; }
+        .btn-group { display: flex; gap: 6px; }
+        .run-file-btn {
+            background-color: #0e639c;
+            color: #ffffff;
+            border: none;
+            padding: 5px 14px;
+            font-size: 11px;
+            font-family: inherit;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 3px;
+        }
+        .run-file-btn:hover { background-color: #1177bb; }
         .save-btn {
             background-color: #238636;
             color: #ffffff;
@@ -385,7 +392,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
 
         .terminal-pane {
-            height: 45%;
+            height: 48%;
             display: flex;
             flex-direction: column;
             padding: 8px 12px 12px 12px;
@@ -437,32 +444,6 @@ HTML_CONTENT = """<!DOCTYPE html>
             border-radius: 3px;
         }
         .submit-btn:hover { background-color: #1177bb; }
-
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0;
-            width: 100vw; height: 100vh;
-            background-color: rgba(0, 0, 0, 0.75);
-            align-items: center; justify-content: center;
-            z-index: 1000;
-        }
-        .modal-box {
-            background-color: #252526;
-            border: 1px solid #333333;
-            width: 90%; max-width: 550px;
-            padding: 20px; border-radius: 4px;
-            display: flex; flex-direction: column; gap: 12px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.8);
-        }
-        .modal-title { font-size: 14px; font-weight: bold; color: #ffffff; }
-        .modal-sub { font-size: 12px; color: #aaaaaa; }
-        .cmd-box { background-color: #0d0d0d; border: 1px solid #333333; padding: 10px; font-size: 12px; color: #00ff66; border-radius: 3px; white-space: pre-wrap; }
-        .exp-box { background-color: #1e1e1e; border: 1px solid #333333; padding: 10px; font-size: 12px; color: #ce9178; border-radius: 3px; }
-        .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
-        .btn-cancel { background-color: #3a3d41; color: #ffffff; border: none; padding: 8px 14px; font-family: inherit; font-size: 12px; cursor: pointer; border-radius: 3px; }
-        .btn-approve { background-color: #238636; color: #ffffff; border: none; padding: 8px 16px; font-family: inherit; font-size: 12px; font-weight: bold; cursor: pointer; border-radius: 3px; }
-        .btn-approve:hover { background-color: #2ea043; }
     </style>
 </head>
 <body>
@@ -478,7 +459,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             <div class="section-header">
                 <span>Workshop Files</span>
                 <div>
-                    <button class="action-btn-sm" onclick="createNewFile()">+ New</button>
+                    <button class="action-btn-sm" onclick="createNewFile()">+ New File</button>
                     <button class="action-btn-sm" onclick="loadFileList()">🔄</button>
                 </div>
             </div>
@@ -487,20 +468,24 @@ HTML_CONTENT = """<!DOCTYPE html>
             <div class="section-header" style="margin-top: 12px;">
                 <span>AI Command Templates</span>
             </div>
-            <button class="template-btn" onclick="runTemplate('Run main.py in terminal')">▶️ Run main.py in terminal</button>
-            <button class="template-btn" onclick="runTemplate('Create a main.py file with print statement')">📝 Create main.py</button>
-            <button class="template-btn" onclick="runTemplate('List all files in workshop')">📂 List files (ls -la)</button>
-            <button class="template-btn" onclick="runTemplate('Find python files in workshop')">🔍 Find python files</button>
-            <button class="template-btn" onclick="runTemplate('Create a folder named data')">📁 Create data folder</button>
+            <button class="template-btn" onclick="directExecuteCommand('python3 main.py', 'Executing main.py')">▶️ Run main.py</button>
+            <button class="template-btn" onclick="directExecuteCommand('ls -la', 'Listing files')">📂 List files (ls -la)</button>
+            <button class="template-btn" onclick="runAiPrompt('Create a file named app.py with print statement')">📝 Create app.py</button>
+            <button class="template-btn" onclick="runAiPrompt('Find python files in workshop')">🔍 Find python files</button>
+            <button class="template-btn" onclick="runAiPrompt('Create a folder named data')">📁 Create data folder</button>
+            <button class="template-btn" onclick="directExecuteCommand('cat main.py', 'Viewing main.py')">📖 Read main.py</button>
         </div>
 
         <div class="content-area">
             <div class="editor-pane">
                 <div class="editor-toolbar">
-                    <div>📄 Active File: <span class="active-file-label" id="activeFileName">Select a file from sidebar</span></div>
-                    <button class="save-btn" id="saveBtn" onclick="saveActiveFile()" disabled>💾 Save File</button>
+                    <div>📄 Active File: <span class="active-file-label" id="activeFileName">main.py</span></div>
+                    <div class="btn-group">
+                        <button class="run-file-btn" id="runFileBtn" onclick="runActiveFile()">▶️ RUN FILE</button>
+                        <button class="save-btn" id="saveBtn" onclick="saveActiveFile()">💾 SAVE FILE</button>
+                    </div>
                 </div>
-                <textarea class="code-textarea" id="codeEditor" placeholder="Click any file on the left sidebar to view & edit code..." disabled></textarea>
+                <textarea class="code-textarea" id="codeEditor" placeholder="Select a file from the sidebar to view & edit code..."></textarea>
             </div>
 
             <div class="terminal-pane">
@@ -509,36 +494,21 @@ HTML_CONTENT = """<!DOCTYPE html>
                     <button class="action-btn-sm" onclick="clearLog()">🗑️ Clear Log</button>
                 </div>
                 <div class="terminal-log" id="terminalLog">
-<span class="log-system">[SYSTEM] Interactive Code Editor & AI Agent initialized.</span>
-<span class="log-system">[SYSTEM] Click any file on the left to edit code. Use prompt bar below to execute terminal commands.</span>
+<span class="log-system">[SYSTEM] Interactive Code Editor & Terminal initialized.</span>
+<span class="log-system">[SYSTEM] Click [▶️ RUN FILE] above or type commands below to execute live in ./workshop.</span>
 --------------------------------------------------------------------------------------------------
 </div>
                 <div class="input-bar">
-                    <input type="text" class="prompt-input" id="promptInput" placeholder="Type prompt (e.g. 'Run main.py' or 'Create test.py')...">
-                    <button class="submit-btn" id="submitBtn" onclick="submitPrompt()">GENERATE COMMAND</button>
+                    <input type="text" class="prompt-input" id="promptInput" placeholder="Type command (e.g. 'python3 main.py', 'ls -la', 'Create app.py')...">
+                    <button class="submit-btn" id="submitBtn" onclick="submitInput()">RUN COMMAND</button>
                 </div>
             </div>
         </div>
     </div>
 </div>
 
-<div class="modal-overlay" id="confirmModal">
-    <div class="modal-box">
-        <div class="modal-title">CONFIRM COMMAND EXECUTION</div>
-        <div class="modal-sub">Proposed shell command to run inside <b>./workshop</b>:</div>
-        <div class="cmd-box" id="modalCmd"></div>
-        <div class="exp-box" id="modalExp"></div>
-        <div class="modal-actions">
-            <button class="btn-cancel" onclick="closeModal(false)">CANCEL</button>
-            <button class="btn-approve" onclick="closeModal(true)">APPROVE & EXECUTE</button>
-        </div>
-    </div>
-</div>
-
 <script>
-    var activeFilePath = null;
-    var pendingCommand = "";
-    var pendingExplanation = "";
+    var activeFilePath = "main.py";
 
     function escapeHtml(text) {
         if (!text) return "";
@@ -602,7 +572,6 @@ HTML_CONTENT = """<!DOCTYPE html>
         activeFilePath = filePath;
         var nameLabel = document.getElementById('activeFileName');
         var editor = document.getElementById('codeEditor');
-        var saveBtn = document.getElementById('saveBtn');
 
         if (nameLabel) nameLabel.textContent = filePath;
 
@@ -615,14 +584,17 @@ HTML_CONTENT = """<!DOCTYPE html>
                 editor.value = data.content;
                 editor.disabled = false;
             }
-            if (saveBtn) saveBtn.disabled = false;
+            loadFileList();
         } catch (err) {
             appendLog('<span class="log-stderr">[ERROR] Could not open ' + escapeHtml(filePath) + ': ' + escapeHtml(err.message) + '</span>');
         }
     }
 
     async function saveActiveFile() {
-        if (!activeFilePath) return;
+        if (!activeFilePath) {
+            alert('Please select a file to save.');
+            return;
+        }
         var editor = document.getElementById('codeEditor');
         if (!editor) return;
         var content = editor.value;
@@ -635,12 +607,24 @@ HTML_CONTENT = """<!DOCTYPE html>
             });
             var data = await res.json();
             if (res.ok) {
-                appendLog('<span class="log-system">[FILE SAVED] ' + escapeHtml(activeFilePath) + ' successfully updated.</span>');
+                appendLog('<span class="log-system">[FILE SAVED] Saved changes to ' + escapeHtml(activeFilePath) + '</span>');
             } else {
                 alert('Save error: ' + (data.detail || 'Unknown error'));
             }
         } catch (err) {
             alert('Save error: ' + err.message);
+        }
+    }
+
+    function runActiveFile() {
+        if (!activeFilePath) {
+            alert('No file selected!');
+            return;
+        }
+        if (activeFilePath.endsWith('.py')) {
+            directExecuteCommand('python3 ' + activeFilePath, 'Executing ' + activeFilePath);
+        } else {
+            directExecuteCommand('cat ' + activeFilePath, 'Viewing ' + activeFilePath);
         }
     }
 
@@ -682,9 +666,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                     activeFilePath = null;
                     document.getElementById('activeFileName').textContent = 'Select a file from sidebar';
                     var editor = document.getElementById('codeEditor');
-                    if (editor) { editor.value = ''; editor.disabled = true; }
-                    var saveBtn = document.getElementById('saveBtn');
-                    if (saveBtn) saveBtn.disabled = true;
+                    if (editor) editor.value = '';
                 }
                 await loadFileList();
                 appendLog('<span class="log-system">[FILE DELETED] ' + escapeHtml(filePath) + ' deleted.</span>');
@@ -694,29 +676,38 @@ HTML_CONTENT = """<!DOCTYPE html>
         }
     }
 
-    function runTemplate(promptText) {
-        var input = document.getElementById('promptInput');
-        if (input) {
-            input.value = promptText;
-            submitPrompt();
+    async function directExecuteCommand(cmd, label) {
+        appendLog('\n<span class="log-cmd">$ ' + escapeHtml(cmd) + '</span>');
+        if (label) {
+            appendLog('<span class="log-exp"># ' + escapeHtml(label) + '</span>');
         }
+
+        try {
+            var res = await fetch('/api/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command: cmd })
+            });
+            var result = await res.json();
+
+            if (result.stdout && result.stdout.trim()) {
+                appendLog('<span class="log-stdout">' + escapeHtml(result.stdout.trim()) + '</span>');
+            }
+            if (result.stderr && result.stderr.trim()) {
+                appendLog('<span class="log-stderr">' + escapeHtml(result.stderr.trim()) + '</span>');
+            }
+            if (!result.stdout && !result.stderr) {
+                appendLog('<span class="log-system">[Done] (exit code ' + result.returncode + ')</span>');
+            }
+        } catch (err) {
+            appendLog('<span class="log-stderr">[ERROR] ' + escapeHtml(String(err)) + '</span>');
+        }
+
+        await loadFileList();
     }
 
-    async function submitPrompt() {
-        var input = document.getElementById('promptInput');
-        if (!input) return;
-        var promptText = input.value.trim();
-        if (!promptText) return;
-
-        var btn = document.getElementById('submitBtn');
-        if (btn) {
-            btn.disabled = true;
-            btn.textContent = 'GENERATING...';
-        }
-
-        appendLog('\n<span class="log-prompt">&gt; PROMPT:</span> ' + escapeHtml(promptText));
-        appendLog('<span class="log-system">[AI] Translating prompt to bash command...</span>');
-
+    async function runAiPrompt(promptText) {
+        appendLog('\n<span class="log-prompt">&gt; AI PROMPT: ' + escapeHtml(promptText) + '</span>');
         try {
             var res = await fetch('/api/ai-command', {
                 method: 'POST',
@@ -724,79 +715,39 @@ HTML_CONTENT = """<!DOCTYPE html>
                 body: JSON.stringify({ prompt: promptText })
             });
             var data = await res.json();
-            
-            pendingCommand = data.command || "ls -la";
-            pendingExplanation = data.explanation || "Executes inside workshop sandbox.";
-
-            var modalCmd = document.getElementById('modalCmd');
-            var modalExp = document.getElementById('modalExp');
-            var modal = document.getElementById('confirmModal');
-
-            if (modalCmd) modalCmd.textContent = pendingCommand;
-            if (modalExp) modalExp.textContent = 'Explanation: ' + pendingExplanation;
-            if (modal) modal.style.display = 'flex';
+            var cmd = data.command || ("echo " + promptText);
+            var exp = data.explanation || "";
+            await directExecuteCommand(cmd, exp);
         } catch (err) {
-            appendLog('<span class="log-stderr">[ERROR] AI translation failed: ' + escapeHtml(String(err)) + '</span>');
-        } finally {
-            if (btn) {
-                btn.disabled = false;
-                btn.textContent = 'GENERATE COMMAND';
-            }
+            await directExecuteCommand("echo '" + promptText + "'", "Fallback execution");
         }
     }
 
-    async function closeModal(approved) {
-        var modal = document.getElementById('confirmModal');
-        if (modal) modal.style.display = 'none';
-        
-        if (!approved) {
-            appendLog('<span class="log-system">[CANCELLED] User cancelled command execution.</span>');
-            return;
-        }
-
-        appendLog('\n<span class="log-cmd">[CONFIRMED] Running command:</span> ' + escapeHtml(pendingCommand));
-        appendLog('<span class="log-exp">[EXPLANATION] ' + escapeHtml(pendingExplanation) + '</span>');
-
-        try {
-            var res = await fetch('/api/execute', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ command: pendingCommand, explanation: pendingExplanation })
-            });
-            var result = await res.json();
-
-            if (result.stdout) {
-                appendLog('<span class="log-stdout">[STDOUT]\n' + escapeHtml(result.stdout.trim()) + '</span>');
-            }
-            if (result.stderr) {
-                appendLog('<span class="log-stderr">[STDERR]\n' + escapeHtml(result.stderr.trim()) + '</span>');
-            }
-            appendLog('<span class="log-system">[EXIT CODE] ' + result.returncode + '</span>');
-        } catch (err) {
-            appendLog('<span class="log-stderr">[ERROR] Execution failed: ' + escapeHtml(String(err)) + '</span>');
-        }
-
+    async function submitInput() {
         var input = document.getElementById('promptInput');
-        if (input) input.value = '';
-        await loadFileList();
+        if (!input) return;
+        var text = input.value.trim();
+        if (!text) return;
+        input.value = '';
 
-        if (activeFilePath) {
-            openFile(activeFilePath);
+        var lower = text.toLowerCase();
+        if (lower.startsWith('python') || lower.startsWith('ls') || lower.startsWith('cat') || lower.startsWith('mkdir') || lower.startsWith('touch') || lower.startsWith('rm') || lower.startsWith('echo') || lower.startsWith('find') || lower.startsWith('du') || lower.startsWith('pwd')) {
+            await directExecuteCommand(text, 'Terminal command');
+        } else {
+            await runAiPrompt(text);
         }
     }
 
-    // Attach Keydown listener safely
     window.addEventListener('DOMContentLoaded', function() {
         var input = document.getElementById('promptInput');
         if (input) {
             input.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter') {
                     e.preventDefault();
-                    submitPrompt();
+                    submitInput();
                 }
             });
         }
-        // Initial setup
         loadFileList().then(function() {
             openFile('main.py');
         });
@@ -812,5 +763,5 @@ def index():
     return HTML_CONTENT
 
 if __name__ == "__main__":
-    print(f"Starting Web Code Editor Agent on port {PORT}...")
+    print(f"Starting Instant Web Code Editor Agent on port {PORT}...")
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
