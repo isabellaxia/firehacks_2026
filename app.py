@@ -1025,9 +1025,12 @@ def diagnose(lat: float = 37.6624, lon: float = -121.8747, prompt: str = "5 km r
 
 
 @app.get("/api/saved")
-def list_saved():
-    """Every route anyone has saved. Public by design."""
-    return {"routes": [{k: v for k, v in r.items() if k != "geojson"} for r in _saved]}
+def list_saved(room: str = ""):
+    """Routes saved to one room. A room is just a short shared code."""
+    code = (room or "").strip().upper()[:8]
+    rs = [r for r in _saved if r.get("room", "") == code]
+    return {"room": code,
+            "routes": [{k: v for k, v in r.items() if k != "geojson"} for r in rs]}
 
 
 @app.get("/api/saved/{route_id}")
@@ -1045,6 +1048,7 @@ def save_route(payload: dict):
         return {"error": "Nothing to save."}
     entry = {
         "id": f"r{int(time.time() * 1000) % 10_000_000}{len(_saved)}",
+        "room": (p.get("room") or "").strip().upper()[:8],
         "name": (p.get("name") or "Untitled loop")[:60],
         "by": (p.get("by") or "anonymous")[:24],
         "distance_mi": p.get("distance_mi"),
@@ -1430,6 +1434,9 @@ nav.tabs button[aria-selected="true"]{color:var(--leaf-dk);border-bottom-color:v
 .card h4{font-family:var(--d);font-weight:700;font-size:15px;margin:0 0 3px}
 .card .meta{font-size:11.5px;color:var(--soft)}
 .card .rm{float:right;color:var(--stone);font-size:11px;text-decoration:underline}
+.roombar{background:var(--leaf-lt);border-radius:10px;padding:12px 14px;margin-bottom:14px}
+.roombar .saverow{margin-bottom:4px}
+.roombar input{text-transform:uppercase;letter-spacing:.12em;font-weight:600}
 .editbox{display:none;margin-top:11px;padding-top:11px;border-top:1px solid var(--line)}
 .card.on .editbox{display:block}
 .saverow{display:grid;grid-template-columns:1fr auto;gap:7px;margin-bottom:7px}
@@ -1452,7 +1459,7 @@ nav.tabs button[aria-selected="true"]{color:var(--leaf-dk);border-bottom-color:v
   <aside>
     <div class="head">
       <h1>Green<em>Route</em></h1>
-      <div class="tag">Six loops, least green to most green</div>
+      <div class="tag">Running loops, your way</div>
     </div>
 
     <nav class="tabs">
@@ -1469,14 +1476,19 @@ nav.tabs button[aria-selected="true"]{color:var(--leaf-dk);border-bottom-color:v
     <div class="body">
       <div class="pane on" id="pane-plan">
         <div id="out">
-          <p class="empty">Type how far you want to go, then choose a starting point on
-          the map. You will get six loops of that length, from the most built-up to the
-          leafiest, and a slider to move between them.</p>
+          <p class="empty">Type a distance, pick a start on the map, and press Find routes.</p>
         </div>
       </div>
       <div class="pane" id="pane-saved">
-        <p class="empty" id="savedempty">Nothing saved yet. Plan a loop, then press Save
-        and it will appear here for everyone who opens this site.</p>
+        <div class="roombar">
+          <div class="saverow">
+            <input id="roomcode" placeholder="Room code" maxlength="8">
+            <button class="go" id="joinroom" style="width:auto;padding:9px 14px">Open</button>
+          </div>
+          <p class="tiny" id="roomnote">Enter a code to open a room, or
+            <a id="newroom">make a new one</a>.</p>
+        </div>
+        <p class="empty" id="savedempty">Nothing saved in this room yet.</p>
         <div id="savedlist"></div>
       </div>
     </div>
@@ -1490,7 +1502,46 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const HOME = [37.6624, -121.8747];
 let MAP = null, layers = [], startMarker = null, DATA = null, SEL = 0, LABELS = {},
-    CORR = {}, USER_W = null;
+    CORR = {}, USER_W = null, ROOM = '';
+
+/* Room code lives in the URL, so sharing the link shares the room. */
+function readRoom() {
+  const mm = location.hash.match(/room=([A-Z0-9]{1,8})/i);
+  return mm ? mm[1].toUpperCase() : '';
+}
+function setRoom(code) {
+  ROOM = (code || '').toUpperCase().slice(0, 8);
+  location.hash = ROOM ? 'room=' + ROOM : '';
+  const inp = document.getElementById('roomcode');
+  if (inp) inp.value = ROOM;
+  const note = document.getElementById('roomnote');
+  if (note) note.innerHTML = ROOM
+    ? `Room <b>${ROOM}</b> — share this page's link to invite others.`
+    : 'Enter a code to open a room, or <a id="newroom">make a new one</a>.';
+  const nr = document.getElementById('newroom');
+  if (nr) nr.addEventListener('click', makeRoom);
+}
+function makeRoom() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let c = '';
+  for (let i = 0; i < 6; i++) c += A[Math.floor(Math.random() * A.length)];
+  setRoom(c);
+  loadSaved();
+}
+
+/* Older saved routes may predate the stored link, so rebuild it from the
+   geometry rather than hiding the button. */
+function gmapsFor(geo) {
+  const cs = (geo && geo.geometry && geo.geometry.coordinates) || [];
+  if (cs.length < 2) return '';
+  const k = Math.min(22, cs.length);
+  const step = (cs.length - 1) / (k - 1);
+  const pts = [];
+  for (let i = 0; i < k; i++) pts.push(cs[Math.min(cs.length - 1, Math.round(i * step))]);
+  if (pts[pts.length - 1] !== cs[0]) pts.push(cs[0]);
+  const legs = pts.map(c => `${c[1].toFixed(5)},${c[0].toFixed(5)}`).join('/');
+  return `https://www.google.com/maps/dir/${legs}/data=!3m1!4b1!4m2!4m1!3e2`;
+}
 
 /* ── map ─────────────────────────────────────────────────────────────────── */
 (function () {
@@ -1549,13 +1600,17 @@ $('#locate').addEventListener('click', () => {
   }, () => alert('Could not get your location.'), {timeout: 10000});
 });
 
+setRoom(readRoom());
+$('#joinroom').addEventListener('click', () => {
+  setRoom(document.getElementById('roomcode').value);
+  loadSaved();
+});
 $('#go').addEventListener('click', plan);
 async function plan() {
   const b = $('#go');
   b.disabled = true;
-  b.innerHTML = '<span class="spin"></span>Finding six loops';
-  $('#out').innerHTML = '<p class="empty">Planning fourteen candidates, keeping the six ' +
-    'cleanest loops closest to your distance…</p>';
+  b.innerHTML = '<span class="spin"></span>Finding routes';
+  $('#out').innerHTML = '<p class="empty">Planning…</p>';
   try {
     const res = await fetch('/api/plan-route', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1607,7 +1662,7 @@ async function loadSaved() {
   const box = document.getElementById('savedlist');
   const empty = document.getElementById('savedempty');
   try {
-    const d = await (await fetch('/api/saved')).json();
+    const d = await (await fetch('/api/saved?room=' + encodeURIComponent(ROOM))).json();
     const rs = d.routes || [];
     empty.style.display = rs.length ? 'none' : '';
     box.innerHTML = rs.map(r => `
@@ -1627,11 +1682,9 @@ async function loadSaved() {
             style="width:100%;border:1px solid var(--line);border-radius:8px;
             padding:9px 10px;font-family:var(--b);font-size:13px;margin-bottom:7px">
           <button class="go" data-save="${esc(r.id)}">Save changes</button>
-          ${r.google_maps_url ? `<a class="nav" style="margin-top:7px"
-            href="${esc(r.google_maps_url)}" target="_blank" rel="noopener">
-            Navigate in Google Maps</a>` : ''}
-          ${r.graphhopper_url ? `<a class="nav ghost" href="${esc(r.graphhopper_url)}"
-            target="_blank" rel="noopener">Open the exact loop</a>` : ''}
+          <a class="nav" style="margin-top:7px" data-gmap="${esc(r.id)}"
+            target="_blank" rel="noopener"
+            href="${esc(r.google_maps_url || '#')}">Navigate in Google Maps</a>
         </div>
       </div>`).join('');
 
@@ -1649,6 +1702,17 @@ async function loadSaved() {
         e.stopPropagation();
         await fetch('/api/saved/' + a.dataset.del, {method: 'DELETE'});
         loadSaved();
+      }));
+
+    // fill in any missing map link from the stored geometry, on demand
+    box.querySelectorAll('[data-gmap]').forEach(a =>
+      a.addEventListener('click', async e => {
+        e.stopPropagation();
+        if (a.getAttribute('href') !== '#') return;
+        e.preventDefault();
+        const full = await (await fetch('/api/saved/' + a.dataset.gmap)).json();
+        const url = full.google_maps_url || gmapsFor(full.geojson);
+        if (url) window.open(url, '_blank', 'noopener');
       }));
 
     box.querySelectorAll('[data-save]').forEach(b =>
@@ -1687,8 +1751,9 @@ async function saveCurrent() {
     await fetch('/api/saved', {method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({name, by, distance_mi: r.distance_mi,
         minutes: r.estimated_minutes, elevation_gain_m: r.elevation_gain_m,
-        green: r.scores.green, google_maps_url: r.google_maps_url,
-        graphhopper_url: r.graphhopper_url,
+        green: r.scores.green,
+        google_maps_url: r.google_maps_url || gmapsFor(r.geojson),
+        graphhopper_url: r.graphhopper_url, room: ROOM,
         start: [LAT, LON], geojson: r.geojson})});
     btn.textContent = 'Saved to the public board';
   } catch (e) { btn.textContent = 'Could not save'; }
@@ -1711,8 +1776,8 @@ function render() {
       <h3>Greenery</h3>
       <input type="range" min="0" max="${n - 1}" value="${SEL}" id="dial">
       <div class="ends"><span>built up</span><span>leafiest</span></div>
-      <div class="rung">Loop <b>${SEL + 1}</b> of ${n} &nbsp;·&nbsp; greenery
-        <b>${Math.round(r.scores.green)}</b>/100</div>
+      <div class="rung">${SEL + 1} of ${n} &nbsp;·&nbsp; greenery
+        <b>${Math.round(r.scores.green)}</b></div>
     </div>
 
     <div class="mix">
@@ -1745,7 +1810,7 @@ function render() {
       <input id="saveby" placeholder="You" style="width:88px">
     </div>
     <button class="go" id="savebtn">Save this route</button>
-    <p class="tiny">Saved routes are visible to everyone on this site.</p>
+    <p class="tiny">Saved to your room.</p>
 
     <details>
       <summary>What went into this score</summary>
@@ -1767,9 +1832,8 @@ function render() {
     `<div class="crit"><span>${esc(LABELS[k] || k)}</span>
       <span class="tr"><i style="width:${Math.max(2, r.scores[k])}%"></i></span>
       <span class="v">${Math.round(r.scores[k])}</span></div>`).join('') +
-    `<p class="tiny" style="text-align:left;margin-top:10px">Distance, climb, air and
-      surface are computed from routing and sensor data. The model reads your request
-      and writes the summary; it never produces a number.</p>`;
+    `<p class="tiny" style="text-align:left;margin-top:10px">All figures computed from
+      routing and sensor data.</p>`;
 
   drawRoutes(SEL);
 }
