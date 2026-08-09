@@ -1053,6 +1053,8 @@ def save_route(payload: dict):
         "green": p.get("green"),
         "start": p.get("start"),
         "google_maps_url": p.get("google_maps_url"),
+        "graphhopper_url": p.get("graphhopper_url"),
+        "note": (p.get("note") or "")[:200],
         "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "geojson": p["geojson"],
     }
@@ -1061,6 +1063,25 @@ def save_route(payload: dict):
         del _saved[300:]
         _persist()
     return {"ok": True, "id": entry["id"], "count": len(_saved)}
+
+
+@app.patch("/api/saved/{route_id}")
+def edit_saved(route_id: str, payload: dict):
+    """Rename a saved route, change who it is by, or add a note."""
+    p = payload or {}
+    with _saved_lock:
+        for r in _saved:
+            if r["id"] == route_id:
+                if p.get("name") is not None:
+                    r["name"] = str(p["name"])[:60] or r["name"]
+                if p.get("by") is not None:
+                    r["by"] = str(p["by"])[:24] or r["by"]
+                if p.get("note") is not None:
+                    r["note"] = str(p["note"])[:200]
+                _persist()
+                return {"ok": True, "route": {k: v for k, v in r.items()
+                                              if k != "geojson"}}
+    return {"error": "No route with that id."}
 
 
 @app.delete("/api/saved/{route_id}")
@@ -1409,6 +1430,8 @@ nav.tabs button[aria-selected="true"]{color:var(--leaf-dk);border-bottom-color:v
 .card h4{font-family:var(--d);font-weight:700;font-size:15px;margin:0 0 3px}
 .card .meta{font-size:11.5px;color:var(--soft)}
 .card .rm{float:right;color:var(--stone);font-size:11px;text-decoration:underline}
+.editbox{display:none;margin-top:11px;padding-top:11px;border-top:1px solid var(--line)}
+.card.on .editbox{display:block}
 .saverow{display:grid;grid-template-columns:1fr auto;gap:7px;margin-bottom:7px}
 .saverow input{border:1px solid var(--line);border-radius:8px;padding:9px 10px;
   font-family:var(--b);font-size:13px}
@@ -1547,10 +1570,8 @@ async function plan() {
 
 function pick(i) { SEL = i; render(); }
 
-/* The extra sliders are not separate objectives. Each one is a different way of
-   asking for more or less green: quiet, clean air and safety live in the green,
-   smooth tarmac and simple navigation live on the streets. They all fold into one
-   number, and that number chooses which of the six loops you are looking at. */
+/* Slider mix. Each control carries a signed pull; the combined value selects
+   which of the loaded loops to display. */
 const MIX = [
   {k: 'quiet',  label: 'Quiet',      w:  1.0, def: 50},
   {k: 'air',    label: 'Clean air',  w:  0.9, def: 50},
@@ -1594,19 +1615,52 @@ async function loadSaved() {
         <a class="rm" data-del="${esc(r.id)}">remove</a>
         <h4>${esc(r.name)}</h4>
         <div class="meta">${r.distance_mi} mi · ${r.minutes} min · greenery
-          ${Math.round(r.green ?? 0)}/100 · saved by ${esc(r.by)} · ${esc(r.saved_at)}</div>
+          ${Math.round(r.green ?? 0)}/100 · by ${esc(r.by)} · ${esc(r.saved_at)}</div>
+        ${r.note ? `<div class="meta" style="margin-top:4px;font-style:italic">${
+          esc(r.note)}</div>` : ''}
+        <div class="editbox" id="ed-${esc(r.id)}">
+          <div class="saverow">
+            <input data-f="name" value="${esc(r.name)}" placeholder="Name">
+            <input data-f="by" value="${esc(r.by)}" placeholder="You" style="width:88px">
+          </div>
+          <input data-f="note" value="${esc(r.note || '')}" placeholder="Add a note"
+            style="width:100%;border:1px solid var(--line);border-radius:8px;
+            padding:9px 10px;font-family:var(--b);font-size:13px;margin-bottom:7px">
+          <button class="go" data-save="${esc(r.id)}">Save changes</button>
+          ${r.google_maps_url ? `<a class="nav" style="margin-top:7px"
+            href="${esc(r.google_maps_url)}" target="_blank" rel="noopener">
+            Navigate in Google Maps</a>` : ''}
+          ${r.graphhopper_url ? `<a class="nav ghost" href="${esc(r.graphhopper_url)}"
+            target="_blank" rel="noopener">Open the exact loop</a>` : ''}
+        </div>
       </div>`).join('');
+
     box.querySelectorAll('.card').forEach(c =>
       c.addEventListener('click', async e => {
-        if (e.target.dataset.del) return;
+        if (e.target.closest('a') || e.target.closest('button') ||
+            e.target.tagName === 'INPUT') return;
         const full = await (await fetch('/api/saved/' + c.dataset.id)).json();
         if (full.geojson) showSaved(full);
         box.querySelectorAll('.card').forEach(x => x.classList.toggle('on', x === c));
       }));
+
     box.querySelectorAll('[data-del]').forEach(a =>
       a.addEventListener('click', async e => {
         e.stopPropagation();
         await fetch('/api/saved/' + a.dataset.del, {method: 'DELETE'});
+        loadSaved();
+      }));
+
+    box.querySelectorAll('[data-save]').forEach(b =>
+      b.addEventListener('click', async e => {
+        e.stopPropagation();
+        const card = b.closest('.card');
+        const get = f => card.querySelector(`[data-f="${f}"]`).value;
+        b.disabled = true;
+        b.textContent = 'Saving';
+        await fetch('/api/saved/' + b.dataset.save, {method: 'PATCH',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: get('name'), by: get('by'), note: get('note')})});
         loadSaved();
       }));
   } catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
@@ -1634,6 +1688,7 @@ async function saveCurrent() {
       body: JSON.stringify({name, by, distance_mi: r.distance_mi,
         minutes: r.estimated_minutes, elevation_gain_m: r.elevation_gain_m,
         green: r.scores.green, google_maps_url: r.google_maps_url,
+        graphhopper_url: r.graphhopper_url,
         start: [LAT, LON], geojson: r.geojson})});
     btn.textContent = 'Saved to the public board';
   } catch (e) { btn.textContent = 'Could not save'; }
@@ -1654,7 +1709,6 @@ function render() {
   $('#out').innerHTML = `
     <div class="dialbox">
       <h3>Greenery</h3>
-      <p>Slide to move between the six loops.</p>
       <input type="range" min="0" max="${n - 1}" value="${SEL}" id="dial">
       <div class="ends"><span>built up</span><span>leafiest</span></div>
       <div class="rung">Loop <b>${SEL + 1}</b> of ${n} &nbsp;·&nbsp; greenery
@@ -1663,8 +1717,6 @@ function render() {
 
     <div class="mix">
       <h4>What matters to you</h4>
-      <p>Each of these is another way of asking for more green, or less. They all
-         feed the one slider above.</p>
       ${MIX.map(x => `<div class="mx"><span>${x.label}</span>
         <input type="range" min="0" max="100" value="${MIXV[x.k]}" data-mix="${x.k}">
         </div>`).join('')}
@@ -1693,7 +1745,7 @@ function render() {
       <input id="saveby" placeholder="You" style="width:88px">
     </div>
     <button class="go" id="savebtn">Save this route</button>
-    <p class="tiny">Saved routes appear on the public board for everyone.</p>
+    <p class="tiny">Saved routes are visible to everyone on this site.</p>
 
     <details>
       <summary>What went into this score</summary>
