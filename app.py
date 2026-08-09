@@ -531,7 +531,7 @@ def offset(lat: float, lon: float, bearing_deg: float, metres: float):
 
 
 def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
-                 emphasis: list[str] | None = None, n: int = 10,
+                 emphasis: list[str] | None = None, n: int = 14,
                  hotspots: list | None = None, green_bias: float = 0.0) -> list[dict]:
     """Candidate loops that actually come back the length you asked for.
 
@@ -558,8 +558,8 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
 
     # (seed, waypoint count) pairs. Different seeds send the loop off in different
     # directions; different point counts change how much it wanders.
-    specs = [(1, 3), (7, 4), (13, 5), (23, 3), (31, 4), (41, 5),
-             (53, 6), (67, 3), (79, 4), (97, 5)][:n]
+    specs = [(1, 3), (7, 4), (13, 5), (23, 3), (31, 4), (41, 5), (53, 6), (67, 3),
+             (79, 4), (97, 5), (103, 4), (127, 5), (149, 3), (167, 6)][:n]
 
     def one(spec):
         seed, points = spec
@@ -583,7 +583,7 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
         except Exception as e:
             return {"error": str(e)}
 
-    with cf.ThreadPoolExecutor(max_workers=10) as pool:
+    with cf.ThreadPoolExecutor(max_workers=14) as pool:
         return list(pool.map(one, specs))
 
 
@@ -731,6 +731,7 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
 
     coords = f.get("geometry", {}).get("coordinates", [])
     eles = [c[2] for c in coords if len(c) > 2]
+    loopq = loop_quality(coords)
     green, green_real = s_green(extras, green_fraction(coords, green_pts or []))
     noise, noise_real = s_noise(extras)
     safety, safety_real = s_safety(extras, steps, km)
@@ -766,6 +767,7 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
         "weights": w,
         "estimated": {"green": not green_real, "noise": not noise_real,
                       "safety": not safety_real, "surface": not surface_real},
+        "loop": loopq,
         "extras": {k: v.get("values", []) for k, v in (extras or {}).items()},
         "elevation": {"points": [round(e, 1) for e in eles[::max(1, len(eles)//120)]],
                       "min": round(min(eles), 1) if eles else None,
@@ -773,6 +775,41 @@ def score_route(feature_collection: dict, target_m: float, activity: str,
                       "descent": round(float(props.get("descent") or 0))},
         "geojson": f,
     }
+
+
+def loop_quality(coords: list) -> dict:
+    """How much this route is a real loop rather than an out-and-back with a spur.
+
+    Two measures. Overlap is the share of the route that doubles back over ground
+    it already covered — high on a spur, near zero on a clean loop. Roundness is
+    the enclosed area against the perimeter squared, which peaks for a circle and
+    collapses toward zero for a there-and-back line.
+    """
+    if len(coords) < 8:
+        return {"overlap": 1.0, "roundness": 0.0, "is_loop": False}
+
+    pts = sample_points(coords, 120)
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(math.radians(pts[0][1]))
+    xy = [((c[0] - pts[0][0]) * m_per_deg_lon, (c[1] - pts[0][1]) * m_per_deg_lat)
+          for c in pts]
+
+    near = 0
+    for i, (x1, y1) in enumerate(xy):
+        for j in range(i + 4, len(xy)):
+            x2, y2 = xy[j]
+            if (x1 - x2) ** 2 + (y1 - y2) ** 2 < 900:      # within 30 m
+                near += 1
+                break
+    overlap = near / len(xy)
+
+    area = abs(sum(xy[i][0] * xy[i - 1][1] - xy[i - 1][0] * xy[i][1]
+                   for i in range(len(xy)))) / 2.0
+    per = sum(math.dist(xy[i], xy[i - 1]) for i in range(1, len(xy)))
+    roundness = (4 * math.pi * area / (per * per)) if per > 0 else 0.0
+
+    return {"overlap": round(overlap, 3), "roundness": round(roundness, 3),
+            "is_loop": overlap < 0.34 and roundness > 0.10}
 
 
 def sample_points(coords: list, k: int) -> list:
@@ -1040,13 +1077,19 @@ def _plan(req: PlanRequest):
         seen.add(sig)
         unique.append(r)
 
+    # Keep real loops. An out-and-back with a spur on the end is not what anyone
+    # pictures when they ask for a loop, however close its length is.
+    loops = [r for r in unique if r["loop"]["is_loop"]]
+    if len(loops) < 3:
+        loops = sorted(unique, key=lambda r: r["loop"]["overlap"])[:6]
+
     # Hard distance gate. Ask for five miles, get five miles.
     for tol in (22, 35, 55):
-        on_target = [r for r in unique if abs(r["distance_error_pct"]) <= tol]
+        on_target = [r for r in loops if abs(r["distance_error_pct"]) <= tol]
         if len(on_target) >= 3:
             break
     else:
-        on_target = sorted(unique, key=lambda r: abs(r["distance_error_pct"]))[:4]
+        on_target = sorted(loops, key=lambda r: abs(r["distance_error_pct"]))[:4]
 
     # Six rungs spanning the measured greenery range, so the ladder covers the whole
     # spectrum rather than clustering at one end.
@@ -1147,882 +1190,277 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Route Planner — exercise routes scored on nine criteria</title>
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<title>Green Route</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --pine:#0F1F1B; --panel:#16302A; --card:#1D3B34; --line:#2C544A;
-  --ink:#EAF2ED; --dim:#8FAFA4;
-  --blaze:#E8622C;              /* trail blaze orange */
-  --chalk:#9EC4D2; --good:#5FBF8B; --warn:#E8B84B;
-  --d:"Barlow Condensed",system-ui,sans-serif;
-  --b:"Inter",system-ui,sans-serif;
-  --m:"JetBrains Mono",ui-monospace,monospace;
+  --paper:#FFFFFF; --wash:#F4F9F5; --line:#DCE9DF; --ink:#132318; --soft:#5E7565;
+  --leaf:#2E7D4F; --leaf-dk:#1E5B39; --leaf-lt:#E6F3EA; --stone:#8FA396;
+  --d:"Fraunces",Georgia,serif; --b:"Inter",system-ui,sans-serif;
 }
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;font-family:var(--b);background:var(--pine);color:var(--ink)}
-button{font-family:inherit}
+html,body{margin:0;height:100%;background:var(--paper);color:var(--ink);font-family:var(--b)}
+#app{display:grid;grid-template-columns:380px 1fr;height:100vh}
+aside{border-right:1px solid var(--line);display:flex;flex-direction:column;overflow:hidden}
+#map{height:100vh;background:var(--wash)}
 
-#app{display:grid;grid-template-columns:35% 65%;height:100vh}
-aside{background:var(--panel);overflow-y:auto;padding:22px;border-right:1px solid var(--line)}
-#map{height:100vh;background:#0B1714}
+.head{padding:22px 24px 16px;border-bottom:1px solid var(--line)}
+h1{font-family:var(--d);font-weight:700;font-size:27px;margin:0;letter-spacing:-.02em}
+h1 em{font-style:normal;color:var(--leaf)}
+.tag{font-size:12px;color:var(--soft);margin-top:3px}
 
-h1{font-family:var(--d);font-weight:700;font-size:30px;letter-spacing:.01em;margin:0;
-  text-transform:uppercase;line-height:1}
-h1 span{color:var(--blaze)}
-.sub{font-size:11.5px;color:var(--dim);letter-spacing:.06em;margin:5px 0 20px}
+.ask{padding:18px 24px;border-bottom:1px solid var(--line)}
+textarea{width:100%;height:66px;resize:none;border:1px solid var(--line);border-radius:8px;
+  padding:11px 12px;font-family:var(--b);font-size:14px;color:var(--ink);background:var(--wash)}
+textarea:focus{outline:2px solid var(--leaf);outline-offset:-1px;background:#fff}
+.go{width:100%;margin-top:10px;background:var(--leaf);color:#fff;border:0;border-radius:8px;
+  padding:12px;font-size:14px;font-weight:600;cursor:pointer}
+.go:hover{background:var(--leaf-dk)}
+.go:disabled{opacity:.55;cursor:not-allowed}
+.tiny{font-size:11.5px;color:var(--stone);margin:9px 0 0;text-align:center}
+.tiny a{color:var(--leaf);cursor:pointer;text-decoration:underline}
 
-label{display:block;font-family:var(--d);font-weight:600;font-size:12px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--dim);margin:0 0 7px}
-input,textarea{width:100%;background:#0F2721;color:var(--ink);border:1px solid var(--line);
-  border-radius:3px;padding:10px;font-family:var(--m);font-size:13px}
-textarea{height:74px;resize:vertical;font-family:var(--b)}
-input:focus,textarea:focus,button:focus-visible{outline:2px solid var(--blaze);outline-offset:1px}
-.pair{display:grid;grid-template-columns:1fr 1fr;gap:9px}
-.row{margin-bottom:14px}
+.body{flex:1;overflow-y:auto;padding:18px 24px 24px}
 
-.ghost{background:transparent;color:var(--chalk);border:1px solid var(--line);border-radius:3px;
-  padding:8px 12px;font-size:12px;cursor:pointer;width:100%;margin-top:8px}
-.ghost:hover{border-color:var(--chalk);color:#fff}
-.primary{width:100%;background:var(--blaze);color:#1A0B04;border:0;border-radius:3px;
-  padding:13px;font-family:var(--d);font-weight:700;font-size:16px;letter-spacing:.12em;
-  text-transform:uppercase;cursor:pointer;margin-top:4px}
-.primary:disabled{opacity:.5;cursor:not-allowed}
+.dialbox{background:var(--leaf-lt);border-radius:10px;padding:15px 16px;margin-bottom:16px}
+.dialbox h3{font-family:var(--d);font-weight:700;font-size:16px;margin:0 0 3px}
+.dialbox p{font-size:12px;color:var(--soft);margin:0 0 12px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;
+  background:linear-gradient(90deg,#CBD8CE,var(--leaf));border-radius:4px;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:24px;
+  border-radius:50%;background:#fff;border:3px solid var(--leaf);cursor:pointer;
+  box-shadow:0 1px 4px rgba(0,0,0,.18)}
+input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:#fff;
+  border:3px solid var(--leaf);cursor:pointer}
+.ends{display:flex;justify-content:space-between;font-size:11px;color:var(--soft);margin-top:6px}
+.rung{text-align:center;font-family:var(--d);font-weight:700;font-size:15px;margin-top:8px}
+.rung b{color:var(--leaf)}
 
-.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.chip{background:#0F2721;border:1px solid var(--line);color:var(--dim);border-radius:20px;
-  padding:5px 11px;font-size:11.5px;cursor:pointer}
-.chip:hover{border-color:var(--blaze);color:var(--ink)}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:16px}
+.stat{background:var(--wash);border:1px solid var(--line);border-radius:9px;padding:11px 8px;
+  text-align:center}
+.stat b{display:block;font-family:var(--d);font-weight:700;font-size:20px;line-height:1.1}
+.stat span{font-size:10px;color:var(--soft);text-transform:uppercase;letter-spacing:.07em}
 
-hr{border:0;border-top:1px solid var(--line);margin:20px 0}
+.sum{background:var(--wash);border-left:3px solid var(--leaf);border-radius:0 8px 8px 0;
+  padding:12px 14px;font-size:13.5px;line-height:1.6;color:#243A2B;margin-bottom:16px}
 
-.cond{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.cond div{background:var(--card);border-radius:3px;padding:8px 11px;flex:1;min-width:78px}
-.cond b{display:block;font-family:var(--d);font-weight:700;font-size:21px;line-height:1.1}
-.cond small{font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+.mini{display:grid;grid-template-columns:repeat(6,1fr);gap:5px;margin-bottom:16px}
+.mini button{border:1px solid var(--line);background:#fff;border-radius:7px;padding:8px 2px;
+  cursor:pointer;font-family:var(--b);font-size:11px;color:var(--soft)}
+.mini button b{display:block;font-family:var(--d);font-weight:700;font-size:15px;color:var(--ink)}
+.mini button[aria-pressed="true"]{border-color:var(--leaf);background:var(--leaf-lt)}
+.mini button[aria-pressed="true"] b{color:var(--leaf-dk)}
 
-.summary{background:var(--card);border-left:3px solid var(--blaze);padding:14px 16px;
-  font-size:14px;line-height:1.6;margin-bottom:18px}
-.summary .tagline{font-family:var(--d);font-weight:600;font-size:11px;letter-spacing:.16em;
-  text-transform:uppercase;color:var(--blaze);margin-bottom:7px}
+.nav{display:block;text-align:center;background:var(--leaf);color:#fff;text-decoration:none;
+  border-radius:8px;padding:11px;font-size:13.5px;font-weight:600;margin-bottom:7px}
+.nav:hover{background:var(--leaf-dk)}
+.nav.ghost{background:#fff;color:var(--leaf);border:1px solid var(--line)}
+.nav.ghost:hover{border-color:var(--leaf);background:var(--leaf-lt)}
 
-/* race-bib style candidate cards */
-.cand{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);
-  border-radius:3px;padding:12px 14px;margin-bottom:9px;cursor:pointer;width:100%;
-  text-align:left;color:inherit;display:block}
-.cand:hover{border-color:var(--chalk)}
-.cand.on{border-left-color:var(--blaze);background:#22463D}
-.cand .top{display:flex;align-items:baseline;gap:10px}
-.bib{font-family:var(--d);font-weight:700;font-size:27px;line-height:1;color:var(--blaze);
-  min-width:44px}
-.cand .facts{font-family:var(--m);font-size:11.5px;color:var(--dim);margin-top:3px}
-.cand .facts b{color:var(--ink);font-weight:500}
-.bar{height:5px;background:#0F2721;border-radius:3px;margin-top:9px;overflow:hidden}
-.bar i{display:block;height:100%;background:var(--blaze)}
-
-.breakdown{margin-top:11px;display:none}
-.cand.on .breakdown{display:block}
-.crit{display:grid;grid-template-columns:88px 1fr 34px;gap:8px;align-items:center;
-  font-size:11px;margin-bottom:4px;color:var(--dim)}
-.crit .track{height:6px;background:#0F2721;border-radius:3px;overflow:hidden}
-.crit .track i{display:block;height:100%;background:var(--chalk)}
-.crit .track i.hi{background:var(--good)}
-.crit .track i.lo{background:var(--warn)}
-.crit .v{font-family:var(--m);color:var(--ink);text-align:right}
-.crit .est{color:var(--warn)}
-.note{font-size:10.5px;color:var(--dim);line-height:1.5;margin-top:9px}
-
-.prefs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
-.pref{background:#2A5348;border:1px solid var(--blaze);color:#FFD9C6;border-radius:20px;
-  padding:4px 11px;font-size:11.5px;font-weight:500}
-.pref.none{background:#1D3B34;border-color:var(--line);color:var(--dim)}
-.boosted{color:var(--blaze) !important;font-weight:600}
-.nav{display:block;text-align:center;background:#2A5348;border:1px solid var(--blaze);
-  color:#FFD9C6;text-decoration:none;border-radius:3px;padding:9px;margin-top:10px;
-  font-family:var(--d);font-weight:600;font-size:13px;letter-spacing:.1em;
-  text-transform:uppercase}
-.nav:hover{background:var(--blaze);color:#1A0B04}
-.paint{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:12px}
-.paint button{background:#0F2721;border:1px solid var(--line);color:var(--dim);
-  border-radius:20px;padding:5px 11px;font-size:11px;cursor:pointer}
-.paint button[aria-pressed="true"]{border-color:var(--blaze);color:#FFD9C6;background:#2A5348}
-.legend{display:flex;gap:12px;font-size:10px;color:var(--dim);margin:-6px 0 12px;
-  align-items:center;flex-wrap:wrap}
-.legend i{display:inline-block;width:22px;height:6px;border-radius:2px;margin-right:4px;
-  vertical-align:middle}
-.elev{margin-top:9px;background:#0F2721;border-radius:3px;padding:7px 8px 4px}
-.elev svg{display:block;width:100%;height:52px}
-.elev .cap{display:flex;justify-content:space-between;font-size:9.5px;color:var(--dim);
-  margin-top:2px}
-.dark{background:#4A3A18;color:#F5E3B8;border-left:3px solid var(--warn);padding:10px 13px;
-  font-size:12.5px;line-height:1.5;margin-bottom:14px}
-.dark b{color:#FFF3D6}
-.gpx{display:block;text-align:center;background:transparent;border:1px solid var(--line);
-  color:var(--chalk);border-radius:3px;padding:8px;margin-top:7px;font-size:12px;
-  cursor:pointer;width:100%}
-.gpx:hover{border-color:var(--chalk);color:#fff}
-.radar{background:#0F2721;border-radius:3px;padding:8px;margin-top:10px}
-.radar svg{display:block;width:100%;height:190px}
-.sliders{background:#1D3B34;border:1px solid var(--line);border-radius:3px;padding:13px 14px;
-  margin-bottom:14px}
-.sliders h4{font-family:var(--d);font-weight:700;font-size:12px;letter-spacing:.14em;
-  text-transform:uppercase;margin:0 0 3px;color:var(--blaze)}
-.sliders p{font-size:11px;color:var(--dim);margin:0 0 11px;line-height:1.5}
-.sl{display:grid;grid-template-columns:82px 1fr 30px;gap:8px;align-items:center;
-  font-size:11px;color:var(--dim);margin-bottom:5px}
-.sl input{-webkit-appearance:none;appearance:none;height:4px;background:#0F2721;
-  border:0;border-radius:2px;padding:0}
-.sl input::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;
-  border-radius:50%;background:var(--blaze);cursor:pointer}
-.sl input::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;
-  background:var(--blaze);cursor:pointer}
-.sl b{font-family:var(--m);color:var(--ink);font-weight:500;text-align:right}
-.slfoot{display:flex;gap:7px;margin-top:10px}
-.slfoot button{flex:1;background:transparent;border:1px solid var(--line);color:var(--chalk);
-  border-radius:3px;padding:7px;font-size:11px;cursor:pointer}
-.slfoot button:hover{border-color:var(--blaze);color:#fff}
-.pullbar{background:#0F2721;border-radius:3px;padding:8px 10px;margin:2px 0 10px;
-  font-size:11px;color:var(--dim);line-height:1.5}
-.pullbar b{font-family:var(--m);font-weight:500}
-.pullbar .g{color:#5FBF8B}.pullbar .s{color:#E8B84B}
-.dial{border-top:1px solid var(--line);margin-top:12px;padding-top:11px}
-.replan{width:100%;background:var(--blaze);color:#1A0B04;border:0;border-radius:3px;
-  padding:10px;margin-top:9px;font-family:var(--d);font-weight:700;font-size:13px;
-  letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
-.replan:disabled{opacity:.5;cursor:not-allowed}
-.navwrap{margin-top:10px}
-.nav2{display:block;text-align:center;background:transparent;border:1px solid var(--line);
-  color:var(--chalk);text-decoration:none;border-radius:3px;padding:7px;margin-top:6px;
-  font-size:11.5px}
-.nav2:hover{border-color:var(--chalk);color:#fff}
-.hotspot{font-size:10.5px;color:var(--chalk);margin:-6px 0 12px}
-.reorder{color:var(--blaze);font-size:11px;margin-top:8px;display:none}
-.reorder.on{display:block}
-.play{display:flex;gap:7px;margin-top:9px}
-.play button{flex:1;background:#2A5348;border:1px solid var(--blaze);color:#FFD9C6;
-  border-radius:3px;padding:8px;font-size:12px;cursor:pointer}
-.play button:hover{background:var(--blaze);color:#1A0B04}
-.live{font-family:var(--m);font-size:11px;color:var(--chalk);margin-top:6px;display:none}
-.live.on{display:block}
-.err{background:#3A1C10;border-left:3px solid var(--blaze);padding:12px 14px;font-size:13px;
-  line-height:1.55}
-.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);
-  border-top-color:#1A0B04;border-radius:50%;animation:sp .7s linear infinite;
+details{margin-top:16px;border-top:1px solid var(--line);padding-top:12px}
+summary{font-size:12.5px;color:var(--soft);cursor:pointer}
+.crit{display:grid;grid-template-columns:96px 1fr 30px;gap:8px;align-items:center;
+  font-size:11.5px;color:var(--soft);margin-top:7px}
+.crit .tr{height:6px;background:#EDF3EE;border-radius:3px;overflow:hidden}
+.crit .tr i{display:block;height:100%;background:var(--leaf)}
+.crit .v{font-variant-numeric:tabular-nums;color:var(--ink);text-align:right}
+.crit input[type=range]{height:5px}
+.err{background:#FDECEA;border-left:3px solid #C0392B;color:#7A2318;padding:11px 13px;
+  border-radius:0 8px 8px 0;font-size:13px;line-height:1.5}
+.empty{color:var(--stone);font-size:13px;line-height:1.6}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.35);
+  border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;
   vertical-align:-2px;margin-right:7px}
 @keyframes sp{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.spin{animation:none}}
-@media(max-width:900px){#app{grid-template-columns:1fr;height:auto}#map{height:60vh}}
+@media(max-width:860px){#app{grid-template-columns:1fr;height:auto}#map{height:56vh}
+  aside{border-right:0;border-bottom:1px solid var(--line)}}
 </style>
 </head>
 <body>
-
 <div id="app">
-<aside>
-  <h1>Route<span>·</span>Planner</h1>
-  <p class="sub">Loops scored on nine criteria, not just distance</p>
-
-  <div class="row">
-    <label>Start point</label>
-    <div class="pair">
-      <input id="lat" placeholder="latitude" value="37.6624">
-      <input id="lon" placeholder="longitude" value="-121.8747">
+  <aside>
+    <div class="head">
+      <h1>Green<em>Route</em></h1>
+      <div class="tag">Six loops, least green to most green</div>
     </div>
-    <button class="ghost" id="locate">Use my location</button>
-  </div>
 
-  <div class="row">
-    <label for="prompt">What do you want to do</label>
-    <textarea id="prompt">I want to run about 5 km, as safe as possible.</textarea>
-    <div class="chips">
-      <button class="chip">5k easy run</button>
-      <button class="chip">3 mile walk, as flat as possible</button>
-      <button class="chip">10 km hike, hilly and green</button>
-      <button class="chip">15 km bike ride, quiet roads</button>
+    <div class="ask">
+      <textarea id="prompt" placeholder="I want to run 5 miles">I want to run 5 miles</textarea>
+      <button class="go" id="go">Find routes</button>
+      <p class="tiny"><a id="locate">use my location</a> &nbsp;·&nbsp; or click the map</p>
     </div>
-  </div>
 
-  <button class="primary" id="go">Find best route</button>
-
-  <div id="out"></div>
-  <hr>
-  <div id="criteria" class="note"></div>
-</aside>
-<div id="map"></div>
+    <div class="body" id="out">
+      <p class="empty">Type how far you want to go, then choose a starting point on the
+      map. You will get six loops of that length, from the most built-up to the
+      leafiest, and a slider to move between them.</p>
+    </div>
+  </aside>
+  <div id="map"></div>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-
-/* ── map adapter ───────────────────────────────────────────────────────────
-   Google Maps when a key is configured, Leaflet otherwise. Both expose the same
-   four methods, so nothing downstream cares which one is running. A missing or
-   rejected key falls back rather than leaving a blank rectangle. */
-let MAP = null, layers = [], startMarker = null, DATA = null, LABELS = {};
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const HOME = [37.6624, -121.8747];
+let MAP = null, layers = [], startMarker = null, DATA = null, SEL = 0, LABELS = {},
+    CORR = {}, USER_W = null;
 
-function makeLeaflet() {
-  const m = L.map('map', {zoomControl:true}).setView(HOME, 14);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(m);
-  m.on('click', e => onMapClick(e.latlng.lat, e.latlng.lng));
-  return {
-    engine: 'leaflet',
-    setStart(lat, lon) {
-      if (startMarker) m.removeLayer(startMarker);
-      startMarker = L.circleMarker([lat, lon], {radius:7, color:'#E8622C', weight:3,
-        fillColor:'#0F1F1B', fillOpacity:1}).addTo(m).bindTooltip('Start');
-    },
-    clear() { layers.forEach(l => m.removeLayer(l)); layers = []; },
-    line(coords, on, i) {
-      const l = L.polyline(coords.map(c => [c[1], c[0]]), {
-        color: on ? '#E8622C' : '#9EC4D2', weight: on ? 6 : 3,
-        opacity: on ? 1 : .45, lineJoin:'round'}).addTo(m);
-      if (!on) l.on('click', () => select(i));
-      layers.push(l);
-      return l;
-    },
-    lineColor(coords, color, weight) {
-      const l = L.polyline(coords.map(c => [c[1], c[0]]),
-        {color, weight, opacity:1, lineJoin:'round'}).addTo(m);
-      layers.push(l);
-      return l;
-    },
-    runner(lat, lon) {
-      if (!this._run) {
-        this._run = L.circleMarker([lat, lon], {radius:9, color:'#fff', weight:3,
-          fillColor:'#E8622C', fillOpacity:1}).addTo(m);
-      } else this._run.setLatLng([lat, lon]);
-      this._run.bringToFront();
-    },
-    clearRunner() { if (this._run) { m.removeLayer(this._run); this._run = null; } },
-    panTo(lat, lon) { m.panTo([lat, lon], {animate:true, duration:.3}); },
-    focus(idx) {
-      const all = layers.filter(Boolean);
-      if (!all.length) return;
-      let b = null;
-      all.forEach(l => { b = b ? b.extend(l.getBounds()) : l.getBounds(); });
-      if (b) m.fitBounds(b, {padding:[35,35]});
-    }
-  };
-}
-
-function makeGoogle() {
-  const g = new google.maps.Map(document.getElementById('map'), {
-    center: {lat: HOME[0], lng: HOME[1]}, zoom: 14, mapTypeControl: true,
-    streetViewControl: true, fullscreenControl: true,
-    mapTypeId: google.maps.MapTypeId.ROADMAP
-  });
-  g.addListener('click', e => onMapClick(e.latLng.lat(), e.latLng.lng()));
-  return {
-    engine: 'google',
-    setStart(lat, lon) {
-      if (startMarker) startMarker.setMap(null);
-      startMarker = new google.maps.Marker({position:{lat, lng:lon}, map:g, title:'Start',
-        icon:{path: google.maps.SymbolPath.CIRCLE, scale:8, fillColor:'#0F1F1B',
-              fillOpacity:1, strokeColor:'#E8622C', strokeWeight:3}});
-    },
-    clear() { layers.forEach(l => l.setMap(null)); layers = []; },
-    line(coords, on, i) {
-      const path = coords.map(c => ({lat: c[1], lng: c[0]}));
-      const l = new google.maps.Polyline({path, map:g, geodesic:false,
-        strokeColor: on ? '#E8622C' : '#5A8DA6', strokeWeight: on ? 6 : 3,
-        strokeOpacity: on ? 1 : .6, zIndex: on ? 10 : 1});
-      if (!on) l.addListener('click', () => select(i));
-      layers.push(l);
-      return l;
-    },
-    lineColor(coords, color, weight) {
-      const l = new google.maps.Polyline({path: coords.map(c => ({lat:c[1], lng:c[0]})),
-        map:g, strokeColor:color, strokeWeight:weight, strokeOpacity:1, zIndex:15});
-      layers.push(l);
-      return l;
-    },
-    runner(lat, lon) {
-      if (!this._run) {
-        this._run = new google.maps.Marker({position:{lat, lng:lon}, map:g, zIndex:99,
-          icon:{path: google.maps.SymbolPath.CIRCLE, scale:9, fillColor:'#E8622C',
-                fillOpacity:1, strokeColor:'#fff', strokeWeight:3}});
-      } else this._run.setPosition({lat, lng:lon});
-    },
-    clearRunner() { if (this._run) { this._run.setMap(null); this._run = null; } },
-    panTo(lat, lon) { g.panTo({lat, lng:lon}); },
-    focus() {
-      if (!layers.length) return;
-      const b = new google.maps.LatLngBounds();
-      layers.forEach(l => l.getPath().forEach(pt => b.extend(pt)));
-      g.fitBounds(b, 40);
-    }
-  };
-}
-
-function onMapClick(lat, lon) {
-  document.getElementById('lat').value = lat.toFixed(5);
-  document.getElementById('lon').value = lon.toFixed(5);
-  MAP.setStart(lat, lon);
-}
-
-function startLeaflet(reason) {
+/* ── map ─────────────────────────────────────────────────────────────────── */
+(function () {
   const css = document.createElement('link');
   css.rel = 'stylesheet';
   css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
   document.head.appendChild(css);
   const js = document.createElement('script');
   js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-  js.onload = () => { MAP = makeLeaflet(); MAP.setStart(...HOME); if (DATA) draw(0); };
+  js.onload = initMap;
   document.head.appendChild(js);
-  if (reason) console.warn('Falling back to OpenStreetMap:', reason);
+})();
+
+let m = null;
+function initMap() {
+  m = L.map('map', {zoomControl: true}).setView(HOME, 14);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {maxZoom: 19, attribution: '&copy; OpenStreetMap'}).addTo(m);
+  m.on('click', e => setStart(e.latlng.lat, e.latlng.lng));
+  setStart(HOME[0], HOME[1]);
+}
+let LAT = HOME[0], LON = HOME[1];
+function setStart(lat, lon) {
+  LAT = lat; LON = lon;
+  if (startMarker) m.removeLayer(startMarker);
+  startMarker = L.circleMarker([lat, lon], {radius: 8, color: '#2E7D4F', weight: 3,
+    fillColor: '#fff', fillOpacity: 1}).addTo(m).bindTooltip('Start');
+}
+function drawRoutes(sel) {
+  layers.forEach(l => m.removeLayer(l));
+  layers = [];
+  if (!DATA) return;
+  DATA.routes.forEach((r, i) => {
+    if (i === sel) return;
+    layers.push(L.polyline(r.geojson.geometry.coordinates.map(c => [c[1], c[0]]),
+      {color: '#9DBFA8', weight: 2.5, opacity: .5}).addTo(m).on('click', () => pick(i)));
+  });
+  const r = DATA.routes[sel];
+  const main = L.polyline(r.geojson.geometry.coordinates.map(c => [c[1], c[0]]),
+    {color: '#2E7D4F', weight: 6, opacity: 1, lineJoin: 'round'}).addTo(m);
+  layers.push(main);
+  m.fitBounds(main.getBounds(), {padding: [40, 40]});
 }
 
-window.gmapsReady = () => { MAP = makeGoogle(); MAP.setStart(...HOME); if (DATA) draw(0); };
-window.gm_authFailure = () => startLeaflet('Google Maps rejected the key');
-
-fetch('/api/config').then(r => r.json()).then(c => {
-  if (!c.google_maps_key) return startLeaflet(null);
-  const t = setTimeout(() => { if (!MAP) startLeaflet('Google Maps did not load'); }, 6000);
-  const sc = document.createElement('script');
-  sc.src = 'https://maps.googleapis.com/maps/api/js?key=' +
-           encodeURIComponent(c.google_maps_key) + '&callback=gmapsReady&loading=async';
-  sc.async = true;
-  sc.onload = () => clearTimeout(t);
-  sc.onerror = () => { clearTimeout(t); startLeaflet('Google Maps script blocked'); };
-  document.head.appendChild(sc);
-}).catch(() => startLeaflet('config unavailable'));
-
-let CORR = {}, EXPLAIN = {};
+/* ── data ────────────────────────────────────────────────────────────────── */
 fetch('/api/criteria').then(r => r.json()).then(c => {
   LABELS = Object.fromEntries(c.criteria.map(x => [x.key, x.label]));
   CORR = c.green_correlation || {};
-  EXPLAIN = c.green_explain || {};
-  $('#criteria').innerHTML = '<b style="color:var(--chalk)">What the score measures</b><br>' +
-    c.criteria.map(x => `${esc(x.label)} — ${esc(x.source)}`).join('<br>');
-}).catch(()=>{});
+}).catch(() => {});
 
 $('#locate').addEventListener('click', () => {
-  if (!navigator.geolocation) return alert('This browser has no geolocation.');
-  $('#locate').textContent = 'Locating…';
+  if (!navigator.geolocation) return;
   navigator.geolocation.getCurrentPosition(p => {
-    $('#lat').value = p.coords.latitude.toFixed(5);
-    $('#lon').value = p.coords.longitude.toFixed(5);
-    placeStart(p.coords.latitude, p.coords.longitude);
-    $('#locate').textContent = 'Use my location';
-  }, e => {
-    $('#locate').textContent = 'Use my location';
-    alert('Could not get your location: ' + e.message);
-  }, {enableHighAccuracy:true, timeout:10000});
+    setStart(p.coords.latitude, p.coords.longitude);
+    m.setView([p.coords.latitude, p.coords.longitude], 15);
+  }, () => alert('Could not get your location.'), {timeout: 10000});
 });
 
-document.querySelectorAll('.chip').forEach(b =>
-  b.addEventListener('click', () => { $('#prompt').value = b.textContent; }));
-
-function placeStart(lat, lon) { if (MAP) MAP.setStart(lat, lon); }
-
-function draw(selected) {
-  if (!MAP || !DATA) return;
-  SELECTED = selected;
-  MAP.clear();
-  // unselected loops stay faint underneath so you can see the alternatives
-  DATA.routes.forEach((r, i) => {
-    if (i !== selected) MAP.line(r.geojson.geometry.coordinates, false, i);
-  });
-  paintRoute(DATA.routes[selected], selected);
-  MAP.focus(selected);
+$('#go').addEventListener('click', plan);
+async function plan() {
+  const b = $('#go');
+  b.disabled = true;
+  b.innerHTML = '<span class="spin"></span>Finding six loops';
+  $('#out').innerHTML = '<p class="empty">Planning fourteen candidates, keeping the six ' +
+    'cleanest loops closest to your distance…</p>';
+  try {
+    const res = await fetch('/api/plan-route', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lat: LAT, lon: LON, prompt: $('#prompt').value})});
+    const d = await res.json();
+    if (d.error) $('#out').innerHTML = `<div class="err">${esc(d.error)}</div>`;
+    else { DATA = d; USER_W = null; SEL = Math.min(3, d.routes.length - 1); render(); }
+  } catch (e) {
+    $('#out').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  } finally { b.disabled = false; b.textContent = 'Find routes'; }
 }
 
-function renderCands() {
-  const d = DATA;
-  document.getElementById('cands').innerHTML = d.routes.map((r, i) => `
-    <button class="cand ${i === SELECTED ? 'on' : ''}" data-i="${i}">
-      <div class="top"><span class="bib">${(r.green_level ?? i) + 1}</span>
-        ${r.delta ? `<span style="font-family:var(--m);font-size:11px;color:${
-          r.delta > 0 ? 'var(--good)' : 'var(--warn)'}">${
-          r.delta > 0 ? '+' : ''}${r.delta}</span>` : ''}
-        <span><b style="font-family:var(--d);font-size:17px">${r.distance_mi} mi</b>
-          <span style="color:var(--dim);font-size:12px"> · ${r.distance_km} km</span>
-          <div class="facts">greenery <b>${Math.round(r.scores.green)}</b>/100
-            · ${r.estimated_minutes} min · <b>${r.elevation_gain_m} m</b> climb
-            · <b>${r.turns}</b> turns${
-            Math.abs(r.distance_error_pct ?? 0) > 12
-              ? ` · <span style="color:var(--warn)">${r.distance_error_pct > 0 ? '+' : ''}${
-                  r.distance_error_pct}% vs target</span>` : ''}</div></span></div>
-      <div class="bar"><i style="width:${Math.max(3, r.scores.green)}%"></i></div>
-      <div class="breakdown">
-        ${Object.keys(r.scores).map(k => critRow(k, r.scores[k], r.weights[k],
-            r.estimated[k])).join('')}
-        ${radar(r, d.routes[i === 0 ? 1 : 0])}
-        ${elevSvg(r)}
-        <div class="play">
-          <button data-fly="${i}">Fly the route</button>
-          <button data-gpx="${i}">Download GPX</button></div>
-        <div class="live" id="live"></div>
-        <div class="navwrap">
-          ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
-            target="_blank" rel="noopener">Navigate this route</a>` : ''}
-          ${r.graphhopper_url ? `<a class="nav2" href="${esc(r.graphhopper_url)}"
-            target="_blank" rel="noopener">Open the exact loop on a full map</a>` : ''}
-        </div>
-      </div>
-    </button>`).join('');
+function pick(i) { SEL = i; render(); }
 
-  document.querySelectorAll('.cand').forEach(el =>
-    el.addEventListener('click', e => {
-      if (e.target.closest('.nav') || e.target.closest('.nav2') ||
-          e.target.closest('.gpx') || e.target.closest('[data-fly]')) return;
-      select(+el.dataset.i);
-    }));
-  document.querySelectorAll('[data-gpx]').forEach(b =>
-    b.addEventListener('click', e => {
-      e.stopPropagation();
-      toGPX(DATA.routes[+b.dataset.gpx], +b.dataset.gpx);
-    }));
-  document.querySelectorAll('[data-fly]').forEach(b =>
-    b.addEventListener('click', e => { e.stopPropagation(); fly(+b.dataset.fly); }));
+function combinedPull() {
+  if (!USER_W || !DATA) return null;
+  const base = DATA.weights.base;
+  let p = 0;
+  for (const k in CORR) p += ((USER_W[k] ?? 0) - (base[k] ?? 0)) * CORR[k];
+  return Math.max(-1, Math.min(1, p * 4));
 }
 
-function wireSliders() {
-  const box = document.getElementById('slidebox');
-  if (!box || !DATA) return;
-  box.innerHTML = sliderPanel();
-  box.querySelectorAll('[data-w]').forEach(inp => {
-    inp.addEventListener('input', () => {
-      USER_W = USER_W || {...DATA.weights.applied};
-      USER_W[inp.dataset.w] = +inp.value / 100;
-      box.querySelector(`[data-wv="${inp.dataset.w}"]`).textContent = inp.value;
-      showPull();
-      rescore();
-    });
-    // no re-planning here: the six loops are already loaded and the slider only
-    // chooses which one to show. New loops come from the button, and nowhere else.
-  });
-  showPull();
-  const dial = document.getElementById('greendial');
-  if (dial) {
-    dial.value = Math.round((DATA.green_bias ?? 0) * 100);
-    dial.addEventListener('input', () => {
-      const n = DATA.routes.length;
-      const t = (+dial.value + 100) / 200;
-      select(Math.max(0, Math.min(n - 1, Math.round(t * (n - 1)))));
-      const el = document.getElementById('pulls');
-      if (el) el.innerHTML = `Greenery dial — showing loop <b>${
-        Math.round(t * (n - 1)) + 1} of ${n}</b>, least green on the left.`;
-    });
-  }
-  const rp = document.getElementById('replan');
-  if (rp) rp.addEventListener('click', async () => {
-    const bias = (+((dial && dial.value) || 0)) / 100;
-    USER_W = null;
-    rp.disabled = true;
-    rp.innerHTML = '<span class="spin"></span>Finding new routes';
-    try {
-      const res = await fetch('/api/plan-route', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({lat: parseFloat($('#lat').value),
-                              lon: parseFloat($('#lon').value),
-                              prompt: $('#prompt').value, green_bias: bias})});
-      const d = await res.json();
-      if (d.error) { alert(d.error); }
-      else {
-        const keep = USER_W, keepDial = bias;
-        render(d);
-        USER_W = keep;
-        wireSliders();
-        const dl = document.getElementById('greendial');
-        if (dl) dl.value = Math.round(keepDial * 100);
-        rescore();
-      }
-    } catch (e) { alert('Could not fetch new routes: ' + e.message); }
-    finally { rp.disabled = false; rp.textContent = 'Find new routes for these weights'; }
-  });
-  box.querySelectorAll('[data-preset]').forEach(b =>
-    b.addEventListener('click', () => {
-      const p = b.dataset.preset;
-      if (p === 'ai') USER_W = null;
-      if (p === 'safe') USER_W = {...DATA.weights.applied, safety: .40, simplicity: .12};
-      if (p === 'green') USER_W = {...DATA.weights.applied, green: .45, noise: .14};
-      if (p === 'nogreen') USER_W = {...DATA.weights.applied, green: .00, distance: .35};
-      PENDING_DIAL = p === 'green' ? 100 : p === 'nogreen' ? -100 : 0;
-      wireSliders();
-      const dl = document.getElementById('greendial');
-      if (dl && PENDING_DIAL !== null) { dl.value = PENDING_DIAL; PENDING_DIAL = null; }
-      rescore();
-    }));
+function render() {
+  const d = DATA, n = d.routes.length, r = d.routes[SEL];
+  const pct = n > 1 ? Math.round((SEL / (n - 1)) * 100) : 100;
+  $('#out').innerHTML = `
+    <div class="dialbox">
+      <h3>Greenery</h3>
+      <p>Slide to move between the six loops.</p>
+      <input type="range" min="0" max="${n - 1}" value="${SEL}" id="dial">
+      <div class="ends"><span>built up</span><span>leafiest</span></div>
+      <div class="rung">Loop <b>${SEL + 1}</b> of ${n} &nbsp;·&nbsp; greenery
+        <b>${Math.round(r.scores.green)}</b>/100</div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b>${r.distance_mi}</b><span>miles</span></div>
+      <div class="stat"><b>${r.estimated_minutes}</b><span>minutes</span></div>
+      <div class="stat"><b>${r.elevation_gain_m}</b><span>m climb</span></div>
+    </div>
+
+    <div class="mini">${d.routes.map((x, i) =>
+      `<button data-i="${i}" aria-pressed="${i === SEL}">
+        <b>${Math.round(x.scores.green)}</b>${x.distance_mi}mi</button>`).join('')}</div>
+
+    <div class="sum">${esc(d.summary)}</div>
+
+    ${r.google_maps_url ? `<a class="nav" href="${esc(r.google_maps_url)}"
+      target="_blank" rel="noopener">Navigate in Google Maps</a>` : ''}
+    ${r.graphhopper_url ? `<a class="nav ghost" href="${esc(r.graphhopper_url)}"
+      target="_blank" rel="noopener">Open the exact loop</a>` : ''}
+    <a class="nav ghost" id="gpx">Download GPX</a>
+
+    <details>
+      <summary>What went into this score</summary>
+      <div id="crits"></div>
+    </details>`;
+
+  $('#dial').addEventListener('input', e => { SEL = +e.target.value; render(); });
+  document.querySelectorAll('.mini button').forEach(b =>
+    b.addEventListener('click', () => pick(+b.dataset.i)));
+  $('#gpx').addEventListener('click', () => toGPX(r));
+  $('#crits').innerHTML = Object.keys(r.scores).map(k =>
+    `<div class="crit"><span>${esc(LABELS[k] || k)}</span>
+      <span class="tr"><i style="width:${Math.max(2, r.scores[k])}%"></i></span>
+      <span class="v">${Math.round(r.scores[k])}</span></div>`).join('') +
+    `<p class="tiny" style="text-align:left;margin-top:10px">Distance, climb, air and
+      surface are computed from routing and sensor data. The model reads your request
+      and writes the summary; it never produces a number.</p>`;
+
+  drawRoutes(SEL);
 }
 
-function select(i) {
-  document.querySelectorAll('.cand').forEach((el, j) => el.classList.toggle('on', j === i));
-  draw(i);
-  refreshPaintBar();
-}
-
-function refreshPaintBar() {
-  const bar = document.getElementById('paintbar');
-  if (!bar || !DATA) return;
-  bar.innerHTML = paintBar();
-  bar.querySelectorAll('[data-paint]').forEach(b =>
-    b.addEventListener('click', () => {
-      PAINT_MODE = b.dataset.paint;
-      draw(SELECTED);
-      refreshPaintBar();
-    }));
-}
-
-let BOOSTED = [];
-function critRow(key, val, weight, estimated) {
-  const cls = val >= 75 ? 'hi' : val < 45 ? 'lo' : '';
-  const up = BOOSTED.includes(key) ? ' boosted' : '';
-  return `<div class="crit"><span class="${estimated?'est':''}${up}">${esc(LABELS[key]||key)}${up?' \u2191':''}${estimated?' *':''}</span>
-    <span class="track"><i class="${cls}" style="width:${Math.max(2,val)}%"></i></span>
-    <span class="v">${Math.round(val)}</span></div>`;
-}
-
-/* ── paint the route by what the data says, segment by segment ──────────────
-   OpenRouteService returns extra_info as [fromIndex, toIndex, value] spans along
-   the geometry. Colouring each span turns the abstract score into something you
-   can see on the map: where the greenery is, where the noise is, where it climbs. */
-const PAINT = {
-  route:     {label:'Route',      scale:null},
-  green:     {label:'Greenery',   scale:v => v/10,        good:'high'},
-  noise:     {label:'Noise',      scale:v => v/10,        good:'low'},
-  steepness: {label:'Steepness',  scale:v => Math.min(1, Math.abs(v)/5), good:'low'},
-  surface:   {label:'Surface',    scale:v => 1 - (SURF[v] ?? .5), good:'low'},
-  waytype:   {label:'Path type',  scale:v => 1 - (WAY[v] ?? .5),  good:'low'},
-};
-const SURF = {1:.80,2:.95,3:.90,4:.85,5:.70,6:.60,7:.55,8:.45,9:.50,10:.40,11:.55,
-              12:.35,13:.30,14:.25,15:.40,16:.65,17:.30,18:.20,20:.50};
-const WAY  = {0:.55,1:.20,2:.40,3:.55,4:.90,5:.85,6:.88,7:.92,8:.60,9:.30,10:.15};
-let PAINT_MODE = 'route';
-
-function ramp(t, goodIsHigh) {
-  const x = Math.max(0, Math.min(1, goodIsHigh ? t : 1 - t));   // 1 = good
-  const stops = [[0,'#C7482A'], [0.5,'#E8B84B'], [1,'#4FA96E']];
-  let a = stops[0], b = stops[2];
-  for (let i = 0; i < stops.length - 1; i++)
-    if (x >= stops[i][0] && x <= stops[i+1][0]) { a = stops[i]; b = stops[i+1]; }
-  const f = (b[0] - a[0]) ? (x - a[0]) / (b[0] - a[0]) : 0;
-  const hex = h => [1,3,5].map(i => parseInt(h.slice(i, i+2), 16));
-  const [r1,g1,b1] = hex(a[1]), [r2,g2,b2] = hex(b[1]);
-  const m = (p,q) => Math.round(p + (q - p) * f);
-  return `rgb(${m(r1,r2)},${m(g1,g2)},${m(b1,b2)})`;
-}
-
-function paintRoute(r, idx) {
-  const spans = (r.extras || {})[PAINT_MODE];
-  const coords = r.geojson.geometry.coordinates;
-  if (PAINT_MODE === 'route' || !spans || !spans.length) {
-    MAP.line(coords, true, idx);
-    return false;
-  }
-  const cfg = PAINT[PAINT_MODE];
-  spans.forEach(([a, b, v]) => {
-    const seg = coords.slice(a, Math.min(b + 1, coords.length));
-    if (seg.length < 2) return;
-    MAP.lineColor(seg, ramp(cfg.scale(v), cfg.good === 'high'), 6);
-  });
-  return true;
-}
-
-function paintBar() {
-  const r = DATA.routes[SELECTED] || {};
-  const avail = Object.keys(PAINT).filter(k =>
-    k === 'route' || ((r.extras || {})[k] || []).length);
-  const legend = PAINT_MODE === 'route' ? '' :
-    `<div class="legend"><span><i style="background:#4FA96E"></i>better</span>
-     <span><i style="background:#E8B84B"></i>mixed</span>
-     <span><i style="background:#C7482A"></i>worse</span>
-     <span style="margin-left:auto">every segment coloured from the routing data</span></div>`;
-  return `<label>Paint the map by</label><div class="paint">${
-    avail.map(k => `<button data-paint="${k}" aria-pressed="${k===PAINT_MODE}">${
-      PAINT[k].label}</button>`).join('')}</div>${legend}`;
-}
-
-function elevSvg(r) {
-  const pts = (r.elevation || {}).points || [];
-  if (pts.length < 3) return '';
-  const lo = Math.min(...pts), hi = Math.max(...pts), span = Math.max(1, hi - lo);
-  const d = pts.map((v, i) =>
-    `${(i / (pts.length - 1)) * 100},${100 - ((v - lo) / span) * 100}`).join(' ');
-  return `<div class="elev">
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none">
-      <polygon points="0,100 ${d} 100,100" fill="#E8622C" opacity=".22"/>
-      <polyline points="${d}" fill="none" stroke="#E8622C" stroke-width="1.6"
-        vector-effect="non-scaling-stroke"/></svg>
-    <div class="cap"><span>${Math.round(lo)} m</span>
-      <span>+${r.elevation_gain_m} m climb · ${r.climb_per_km} m/km</span>
-      <span>${Math.round(hi)} m</span></div></div>`;
-}
-
-function toGPX(r, i) {
+function toGPX(r) {
   const pts = r.geojson.geometry.coordinates.map(c =>
     `<trkpt lat="${c[1].toFixed(6)}" lon="${c[0].toFixed(6)}">${
       c.length > 2 ? `<ele>${c[2].toFixed(1)}</ele>` : ''}</trkpt>`).join('');
   const gpx = `<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="Route Planner" xmlns="http://www.topografix.com/GPX/1/1">
-<metadata><name>${r.distance_mi} mi loop, score ${r.score}</name></metadata>
-<trk><name>Route ${i + 1}</name><trkseg>${pts}</trkseg></trk></gpx>`;
-  const url = URL.createObjectURL(new Blob([gpx], {type:'application/gpx+xml'}));
+<gpx version="1.1" creator="GreenRoute" xmlns="http://www.topografix.com/GPX/1/1">
+<trk><name>${r.distance_mi} mi loop</name><trkseg>${pts}</trkseg></trk></gpx>`;
+  const url = URL.createObjectURL(new Blob([gpx], {type: 'application/gpx+xml'}));
   const a = document.createElement('a');
   a.href = url;
-  a.download = `route-${r.distance_mi}mi-score${Math.round(r.score)}.gpx`;
+  a.download = `greenroute-${r.distance_mi}mi.gpx`;
   a.click();
   URL.revokeObjectURL(url);
 }
-
-let SELECTED = 0, USER_W = null, ANIM = null, PENDING_DIAL = null;
-
-/* ── radar: all nine criteria at a glance ──────────────────────────────────
-   A bar chart shows nine numbers. A radar shows the SHAPE of a route — you can
-   see instantly that one is fast but filthy and another is slow but clean. */
-function radar(r, rival) {
-  const keys = Object.keys(r.scores), n = keys.length, R = 66, cx = 100, cy = 88;
-  const pt = (i, v) => {
-    const a = (Math.PI * 2 * i) / n - Math.PI / 2;
-    return [cx + Math.cos(a) * R * (v / 100), cy + Math.sin(a) * R * (v / 100)];
-  };
-  const poly = o => keys.map((k, i) => pt(i, o.scores[k]).map(x => x.toFixed(1)).join(',')).join(' ');
-  const rings = [25, 50, 75, 100].map(p =>
-    `<polygon points="${keys.map((_, i) => pt(i, p).map(x => x.toFixed(1)).join(',')).join(' ')}"
-      fill="none" stroke="#2C544A" stroke-width=".7"/>`).join('');
-  const spokes = keys.map((k, i) => {
-    const [x, y] = pt(i, 100);
-    const [lx, ly] = pt(i, 128);
-    return `<line x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}"
-      stroke="#2C544A" stroke-width=".6"/>
-      <text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}" fill="#8FAFA4" font-size="6.5"
-        text-anchor="middle" dominant-baseline="middle">${
-        (LABELS[k] || k).split(' ')[0]}</text>`;
-  }).join('');
-  const rivalPoly = rival ?
-    `<polygon points="${poly(rival)}" fill="none" stroke="#5A8DA6" stroke-width="1.2"
-      stroke-dasharray="3 2"/>` : '';
-  return `<div class="radar"><svg viewBox="0 0 200 176">
-    ${rings}${spokes}${rivalPoly}
-    <polygon points="${poly(r)}" fill="#E8622C" fill-opacity=".28" stroke="#E8622C"
-      stroke-width="1.8"/></svg>
-    <div style="font-size:10px;color:var(--dim);text-align:center;margin-top:-4px">
-      solid = this route${rival ? ' · dashed = next best' : ''}</div></div>`;
-}
-
-/* ── weight sliders: hand the judges the controls ──────────────────────────
-   All nine sub-scores are already computed, so re-ranking is instant and local.
-   Drag safety up and watch the winner change in front of you. */
-function sliderPanel() {
-  const w = USER_W || DATA.weights.applied;
-  return `<div class="sliders">
-    <h4>Tune it yourself</h4>
-    <p>Move any slider to scrub through the six loops below. Quiet, clean air and
-       safety live in the green; smooth tarmac and simple navigation live on streets.</p>
-    <div id="pulls" class="pullbar"></div>
-    ${Object.keys(w).map(k => {
-      const note = '';
-      return `<div class="sl">
-      <span title="${esc(EXPLAIN[k] || '')}">${esc(LABELS[k] || k)}</span>
-      <input type="range" min="0" max="40" value="${Math.round(w[k] * 100)}"
-        data-w="${k}" ${dead ? 'style="opacity:.4"' : ''}>
-      <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`;
-    }).join('')}
-    <div class="slfoot">
-      <button data-preset="ai">Reset</button>
-      <button data-preset="safe">Max safety</button>
-      <button data-preset="green">Max greenery</button>
-      <button data-preset="nogreen">Avoid green</button>
-    </div>
-    <div class="dial">
-      <label style="margin-bottom:6px">Head for the green</label>
-      <div class="sl" style="grid-template-columns:64px 1fr 64px">
-        <span style="font-size:10px">avoid</span>
-        <input type="range" min="-100" max="100" value="0" id="greendial">
-        <span style="font-size:10px;text-align:right">seek out</span>
-      </div>
-      <button class="replan" id="replan">Plan a fresh set of loops</button>
-    </div>
-    <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
-  </div>`;
-}
-
-function combinedPull() {
-  const w = USER_W || (DATA && DATA.weights.applied) || {};
-  const base = (DATA && DATA.weights.base) || {};
-  let pull = 0;
-  for (const k in CORR) pull += ((w[k] ?? 0) - (base[k] ?? 0)) * CORR[k];
-  return Math.max(-1, Math.min(1, pull * 4));
-}
-
-function showPull() {
-  const el = document.getElementById('pulls');
-  if (!el || !DATA) return;
-  const p = combinedPull(), n = DATA.routes.length;
-  const idx = Math.max(0, Math.min(n - 1, Math.round(((p + 1) / 2) * (n - 1))));
-  const dir = p > 0.12 ? '<span class="g">toward green land</span>'
-            : p < -0.12 ? '<span class="s">toward the street grid</span>'
-            : 'balanced';
-  el.innerHTML = `Combined pull <b>${p >= 0 ? '+' : ''}${p.toFixed(2)}</b> — ${dir}.
-    Showing loop <b>${idx + 1} of ${n}</b> on the greenery ladder.`;
-  const dl = document.getElementById('greendial');
-  if (dl) dl.value = Math.round(p * 100);
-}
-
-/* The six loops already span the greenery spectrum, so the combined pull just
-   picks which rung to show. Instant, no request, nothing to wait for. */
-function scheduleReplan() {
-  const n = DATA.routes.length;
-  if (!n) return;
-  const p = combinedPull();                       // -1 .. +1
-  const idx = Math.max(0, Math.min(n - 1, Math.round(((p + 1) / 2) * (n - 1))));
-  select(idx);
-}
-
-async function doReplan(bias) {
-  const rp = document.getElementById('replan');
-  if (rp) { rp.disabled = true; rp.innerHTML = '<span class="spin"></span>Re-planning'; }
-  try {
-    const res = await fetch('/api/plan-route', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({lat: parseFloat($('#lat').value),
-                            lon: parseFloat($('#lon').value),
-                            prompt: $('#prompt').value,
-                            weights: USER_W || undefined,
-                            green_bias: USER_W ? undefined : bias})});
-    const d = await res.json();
-    if (!d.error) {
-      const keep = USER_W;
-      render(d);
-      USER_W = keep;
-      wireSliders();
-      rescore();
-    }
-  } catch (e) { /* keep the current routes rather than blanking the page */ }
-  finally {
-    const b = document.getElementById('replan');
-    if (b) { b.disabled = false; b.textContent = 'Find new routes at this setting'; }
-  }
-}
-
-function rescore() {
-  const raw = USER_W || DATA.weights.applied;
-  const tot = Object.values(raw).reduce((a, b) => a + b, 0) || 1;
-  const w = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v / tot]));
-  const before = DATA.routes.map(r => r.id).join(',');
-  DATA.routes.forEach(r => {
-    const prev = r.score;
-    // rank on the normalised values, exactly as the server does, so a criterion
-    // whose absolute range is small still carries its full weight
-    const src = r.rel || r.scores;
-    r.score = +Object.keys(w).reduce((s, k) => s + w[k] * (src[k] ?? 50), 0).toFixed(1);
-    r.delta = +(r.score - prev).toFixed(1);
-    r.weights = w;
-  });
-  DATA.routes.sort((a, b) => b.score - a.score);
-  SELECTED = 0;
-  renderCands();
-  const after = DATA.routes.map(r => r.id).join(',');
-  const el = document.getElementById('reorder');
-  if (el) {
-    const winnerChanged = before.split(',')[0] !== after.split(',')[0];
-    el.textContent = winnerChanged
-      ? 'The ranking changed — a different loop now wins.'
-      : 'The ranking changed — the order below just shifted.';
-    el.classList.toggle('on', before !== after);
-  }
-  select(0);
-}
-
-/* ── flythrough: run the route in front of them ──────────────────────────── */
-function fly(i) {
-  const r = DATA.routes[i], pts = r.geojson.geometry.coordinates;
-  if (ANIM) { cancelAnimationFrame(ANIM.raf); ANIM = null; MAP.clearRunner(); }
-  const live = document.getElementById('live');
-  if (live) live.classList.add('on');
-  const t0 = performance.now(), dur = 9000;
-  const step = now => {
-    const t = Math.min(1, (now - t0) / dur);
-    const idx = Math.min(pts.length - 1, Math.floor(t * (pts.length - 1)));
-    const c = pts[idx];
-    MAP.runner(c[1], c[0]);
-    if (idx % 12 === 0) MAP.panTo(c[1], c[0]);
-    if (live) live.textContent =
-      `${(r.distance_km * t).toFixed(2)} km of ${r.distance_km} km` +
-      (c.length > 2 ? ` · ${c[2].toFixed(0)} m elevation` : '') +
-      ` · ${Math.round(r.estimated_minutes * t)} min`;
-    if (t < 1) ANIM = {raf: requestAnimationFrame(step)};
-    else { ANIM = null; MAP.focus(i); }
-  };
-  ANIM = {raf: requestAnimationFrame(step)};
-}
-
-function render(d) {
-  DATA = d;
-  BOOSTED = (d.weights && d.weights.changed) || [];
-  const w = d.weather || {}, a = d.air || {};
-  const est = [];
-  $('#out').innerHTML = `
-    <div class="cond">
-      <div><b>${a.aqi ?? '—'}</b><small>AQI</small></div>
-      <div><b>${w.apparent_temperature ?? '—'}&deg;</b><small>feels like</small></div>
-      <div><b>${d.request.target_mi}</b><small>target mi</small></div>
-      <div><b>${esc(d.request.activity)}</b><small>activity</small></div>
-    </div>
-    <label>What I understood</label>
-    <div class="prefs">${
-      (d.request.emphasis_labels && d.request.emphasis_labels.length)
-        ? d.request.emphasis_labels.map(x => `<span class="pref">${esc(x)}</span>`).join('')
-        : '<span class="pref none">no preference stated — using the default balance for ' +
-          esc(d.request.activity) + '</span>'}</div>
-    ${d.daylight && d.daylight.finishes_in_dark
-      ? `<div class="dark">Sunset is at <b>${esc(d.daylight.sunset)}</b> and this takes about
-         <b>${d.daylight.minutes_needed} min</b>. You would be out in the dark for the last
-         <b>${d.daylight.dark_minutes} minutes</b> — take a light, or pick a shorter loop.</div>`
-      : ''}
-    <div class="summary"><div class="tagline">Recommendation</div>${esc(d.summary)}</div>
-    ${(d.hotspots && d.hotspots.length) ? `<div class="hotspot">Nearest green:
-      ${d.hotspots.slice(0,2).map(h =>
-        `${h.features} features ${Math.round(h.distance_m)} m away`).join(' · ')}
-      ${d.green_bias > 0.15 ? '— loops aimed toward it'
-        : d.green_bias < -0.15 ? '— loops aimed away from it' : ''}</div>` : ''}
-    <div id="paintbar"></div>
-    <div id="slidebox"></div>
-    <label>Greenery ladder &mdash; ${d.routes.length} loops, least green first</label>
-    <div id="cands"></div>
-    <p class="note">Air data: ${esc(a.source||'—')}. Greenery measured against
-      ${d.green_features || 0} parks, woods and water features from OpenStreetMap. Distance parsed by ${esc(d.request.parsed_by)}.
-      Scores are computed in Python from routing, elevation, air and weather data —
-      the model reads your request and writes the summary, and never produces a number.
-      An arrow marks a criterion you asked me to prioritise, which was weighted up before
-      ranking. An asterisk marks a criterion OpenRouteService did not supply for this route,
-      where a documented baseline was used instead.</p>`;
-
-  renderCands();
-  draw(0);
-  refreshPaintBar();
-  wireSliders();
-  placeStart(...d.routes[0].geojson.geometry.coordinates[0].slice(0,2).reverse());
-}
-
-$('#go').addEventListener('click', async () => {
-  const lat = parseFloat($('#lat').value), lon = parseFloat($('#lon').value);
-  if (Number.isNaN(lat) || Number.isNaN(lon))
-    return $('#out').innerHTML = '<div class="err">Enter a latitude and longitude, or click the map.</div>';
-  $('#go').disabled = true;
-  $('#go').innerHTML = '<span class="spin"></span>Planning';
-  $('#out').innerHTML = '<p class="note">Reading your request, checking air quality and weather, requesting three loops…</p>';
-  try {
-    const res = await fetch('/api/plan-route', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({lat, lon, prompt: $('#prompt').value})});
-    const d = await res.json();
-    if (d.error) {
-      $('#out').innerHTML = `<div class="err"><b>${esc(d.error)}</b>${
-        d.detail ? '<div class="note">' + esc(d.detail.join(' · ')) + '</div>' : ''}</div>`;
-    } else render(d);
-  } catch (e) {
-    $('#out').innerHTML = `<div class="err">Request failed: ${esc(e.message)}</div>`;
-  } finally {
-    $('#go').disabled = false;
-    $('#go').textContent = 'Find best route';
-  }
-});
-
 </script>
 </body>
-</html>
-"""
+</html>"""
 
