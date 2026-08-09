@@ -365,7 +365,7 @@ def fetch_green(lat: float, lon: float, radius_m: float) -> list:
     if key in _green_cache:
         return _green_cache[key]
     r = int(min(8000, max(1200, radius_m)))
-    q = f"""[out:json][timeout:18];
+    q = f"""[out:json][timeout:13];
 (
   way["leisure"~"park|garden|nature_reserve|recreation_ground"](around:{r},{lat},{lon});
   way["landuse"~"forest|grass|meadow|village_green|recreation"](around:{r},{lat},{lon});
@@ -376,7 +376,7 @@ out center 300;"""
     pts = []
     for host in OVERPASS_HOSTS:
         try:
-            resp = requests.get(host, params={"data": q}, timeout=20,
+            resp = requests.get(host, params={"data": q}, timeout=14,
                                 headers={"User-Agent": "route-planner/1.0 (hackathon)"})
             if resp.status_code != 200:
                 continue
@@ -518,14 +518,24 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     # densest parks nearby. green_bias < 0 means they do not: aim away from them.
     # Half the candidates follow the bias, half stay spread out, so there is always
     # something to compare against.
+    # The bias is continuous, so the candidate mix should be too. At bias 0.3 one
+    # loop chases the nearest park; at 1.0 nearly all of them do, and they aim
+    # tighter. Nudging the slider nudges the route rather than flipping it.
     bearings = []
-    if hotspots and abs(green_bias) > 0.15:
-        for h in hotspots[:3]:
+    if hotspots and abs(green_bias) > 0.12:
+        strength = min(1.0, abs(green_bias))
+        n_seek = max(1, round(strength * (n - 1)))
+        spreadf = 55 * (1.0 - strength) + 12      # tight aim at full strength
+        for i in range(n_seek):
+            h = hotspots[min(i // 2, len(hotspots) - 1)]
             b = h["bearing"] if green_bias > 0 else (h["bearing"] + 180) % 360
-            reach = max(0.55, min(1.35, (h["distance_m"] / max(1.0, r)))) \
-                if green_bias > 0 else 1.0
+            b = (b + (spreadf if i % 2 else -spreadf) * (i // 2 + 1) * 0.5) % 360
+            if green_bias > 0:
+                # reach far enough to actually get there, but stay inside the budget
+                reach = max(0.5, min(1.4, h["distance_m"] / max(1.0, r)))
+            else:
+                reach = 1.0
             bearings.append((b, reach))
-            bearings.append(((b + 40) % 360, reach * 0.85))
     for spec in spread:
         if len(bearings) >= n:
             break
@@ -550,7 +560,7 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
         try:
             resp = requests.post(ORS_URL.format(profile=profile), json=body,
                                  headers={"Authorization": ORS_KEY,
-                                          "Content-Type": "application/json"}, timeout=18)
+                                          "Content-Type": "application/json"}, timeout=14)
             if resp.status_code != 200:
                 return {"error": f"ORS {resp.status_code}: {resp.text[:160]}"}
             return resp.json()
@@ -584,10 +594,20 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
 
 # ────────────────────────────────────────────────────────────── model calls
 
-def parse_request(prompt: str) -> dict:
-    """Free text → target distance in metres and activity. Model picks, Python validates."""
+_parse_cache: dict = {}
+
+
+def parse_request(prompt: str, skip_model: bool = False) -> dict:
+    """Free text → target distance in metres and activity. Model picks, Python validates.
+
+    Cached, and skippable: a re-plan sends the same prompt with new weights, and
+    re-asking the model the same question just adds latency.
+    """
+    key = prompt.strip().lower()
+    if key in _parse_cache:
+        return _parse_cache[key]
     fallback = _regex_parse(prompt)
-    if not FEATHERLESS_KEY:
+    if skip_model or not FEATHERLESS_KEY:
         return fallback
     try:
         r = ai.chat.completions.create(
@@ -622,9 +642,11 @@ def parse_request(prompt: str) -> dict:
         emph = [e for e in (got.get("emphasis") or []) if e in EMPHASIS][:4]
         if not emph:
             emph = fallback["emphasis"]        # keyword safety net
-        return {"target_m": max(400.0, min(50000.0, metres)), "activity": act,
-                "notes": got.get("notes"), "parsed_by": PARSE_MODEL,
-                "emphasis": emph, "stated": f"{val} {unit}"}
+        out = {"target_m": max(400.0, min(50000.0, metres)), "activity": act,
+               "notes": got.get("notes"), "parsed_by": PARSE_MODEL,
+               "emphasis": emph, "stated": f"{val} {unit}"}
+        _parse_cache[key] = out
+        return out
     except Exception:
         return fallback
 
@@ -782,24 +804,24 @@ def graphhopper_url(coords: list, activity: str) -> str:
 
 
 def google_maps_url(coords: list, activity: str) -> str:
-    """A turn-by-turn link the user can open in Google Maps.
+    """Open the loop in Google Maps with as many pins as Google will take.
 
-    Google's URL scheme takes an origin, a destination and up to nine waypoints, so
-    we sample the loop evenly. It is the same loop, walkable turn by turn on a phone.
+    The documented ?api=1 form caps at nine waypoints, which turns a loop into a
+    rough approximation. The path form — /maps/dir/lat,lng/lat,lng/... — accepts
+    far more stops, so the line Google draws follows the planned route closely.
+    The trailing data parameter sets the travel mode: 3e2 walking, 3e1 cycling.
     """
     if not coords or len(coords) < 2:
         return ""
-    picked = sample_points(coords, 10)
-    pts = [(c[1], c[0]) for c in picked]          # GeoJSON is [lon, lat]
-    start = pts[0]
-    way = pts[1:-1][:8]
-    mode = {"cycle": "bicycling"}.get(activity, "walking")
-    fmt = lambda p: f"{p[0]:.5f},{p[1]:.5f}"
-    url = ("https://www.google.com/maps/dir/?api=1"
-           f"&origin={fmt(start)}&destination={fmt(start)}&travelmode={mode}")
-    if way:
-        url += "&waypoints=" + "|".join(fmt(p) for p in way)
-    return url
+    picked = sample_points(coords, 22)
+    # close the loop explicitly so Google returns to the start
+    if picked[-1] != coords[0]:
+        picked.append(coords[0])
+    legs = "/".join(f"{c[1]:.5f},{c[0]:.5f}" for c in picked)
+    mode = "!3e1" if activity == "cycle" else "!3e2"
+    mid = picked[len(picked) // 2]
+    return (f"https://www.google.com/maps/dir/{legs}"
+            f"/@{mid[1]:.5f},{mid[0]:.5f},15z/data=!3m1!4b1!4m2!4m1{mode}")
 
 
 # ────────────────────────────────────────────────────────────── API
@@ -907,23 +929,29 @@ def _plan(req: PlanRequest):
     if not (-90 <= req.lat <= 90 and -180 <= req.lon <= 180):
         return {"error": "Those coordinates are not on Earth. Check latitude and longitude."}
 
-    parsed = parse_request(req.prompt)
+    parsed = parse_request(req.prompt, skip_model=req.green_bias is not None)
     emphasis = parsed.get("emphasis") or []
     base_w = WEIGHTS.get(parsed["activity"], WEIGHTS["run"])
     weights = apply_emphasis(base_w, emphasis)
     climb_ideal = next((CLIMB_OVERRIDE[e] for e in emphasis if e in CLIMB_OVERRIDE), None)
 
-    # context lookups run together; none of them should be able to stall the plan
+    # Only the green-bias path needs the park lookup, and that lookup is the slowest
+    # thing here. Skip it unless it will actually be used, so an ordinary plan never
+    # waits on Overpass. When it is needed, a cached result usually makes it instant.
+    need_green = req.green_bias is not None and abs(req.green_bias) > 0.15
     with cf.ThreadPoolExecutor(max_workers=3) as pool:
         f_air = pool.submit(fetch_air, req.lat, req.lon)
         f_wx = pool.submit(fetch_weather, req.lat, req.lon)
-        f_gr = pool.submit(fetch_green, req.lat, req.lon, parsed["target_m"] * 0.8)
+        f_gr = pool.submit(fetch_green, req.lat, req.lon,
+                           parsed["target_m"] * 0.8) if need_green else None
         air = f_air.result()
         weather = f_wx.result()
-        try:
-            green_pts = f_gr.result(timeout=22)
-        except Exception:
-            green_pts = []
+        green_pts = []
+        if f_gr is not None:
+            try:
+                green_pts = f_gr.result(timeout=16)
+            except Exception:
+                green_pts = []
 
     hotspots = green_hotspots(req.lat, req.lon, green_pts)
 
@@ -1196,6 +1224,7 @@ hr{border:0;border-top:1px solid var(--line);margin:20px 0}
 .slfoot button{flex:1;background:transparent;border:1px solid var(--line);color:var(--chalk);
   border-radius:3px;padding:7px;font-size:11px;cursor:pointer}
 .slfoot button:hover{border-color:var(--blaze);color:#fff}
+.dial{border-top:1px solid var(--line);margin-top:12px;padding-top:11px}
 .replan{width:100%;background:var(--blaze);color:#1A0B04;border:0;border-radius:3px;
   padding:10px;margin-top:9px;font-family:var(--d);font-weight:700;font-size:13px;
   letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
@@ -1493,12 +1522,11 @@ function wireSliders() {
       box.querySelector(`[data-wv="${inp.dataset.w}"]`).textContent = inp.value;
       rescore();
     }));
+  const dial = document.getElementById('greendial');
+  if (dial) dial.value = Math.round((DATA.green_bias ?? 0) * 100);
   const rp = document.getElementById('replan');
   if (rp) rp.addEventListener('click', async () => {
-    const w = USER_W || DATA.weights.applied;
-    const base = DATA.weights.base.green ?? 0.1;
-    // above the default greenery weight means seek parks, below means avoid them
-    const bias = Math.max(-1, Math.min(1, ((w.green ?? base) - base) / 0.3));
+    const bias = (+((dial && dial.value) || 0)) / 100;
     rp.disabled = true;
     rp.innerHTML = '<span class="spin"></span>Finding new routes';
     try {
@@ -1509,7 +1537,15 @@ function wireSliders() {
                               prompt: $('#prompt').value, green_bias: bias})});
       const d = await res.json();
       if (d.error) { alert(d.error); }
-      else { const keep = USER_W; render(d); USER_W = keep; wireSliders(); rescore(); }
+      else {
+        const keep = USER_W, keepDial = bias;
+        render(d);
+        USER_W = keep;
+        wireSliders();
+        const dl = document.getElementById('greendial');
+        if (dl) dl.value = Math.round(keepDial * 100);
+        rescore();
+      }
     } catch (e) { alert('Could not fetch new routes: ' + e.message); }
     finally { rp.disabled = false; rp.textContent = 'Find new routes for these weights'; }
   });
@@ -1520,7 +1556,10 @@ function wireSliders() {
       if (p === 'safe') USER_W = {...DATA.weights.applied, safety: .40, simplicity: .12};
       if (p === 'green') USER_W = {...DATA.weights.applied, green: .45, noise: .14};
       if (p === 'nogreen') USER_W = {...DATA.weights.applied, green: .00, distance: .35};
+      PENDING_DIAL = p === 'green' ? 100 : p === 'nogreen' ? -100 : 0;
       wireSliders();
+      const dl = document.getElementById('greendial');
+      if (dl && PENDING_DIAL !== null) { dl.value = PENDING_DIAL; PENDING_DIAL = null; }
       rescore();
     }));
 }
@@ -1644,7 +1683,7 @@ function toGPX(r, i) {
   URL.revokeObjectURL(url);
 }
 
-let SELECTED = 0, USER_W = null, ANIM = null;
+let SELECTED = 0, USER_W = null, ANIM = null, PENDING_DIAL = null;
 
 /* ── radar: all nine criteria at a glance ──────────────────────────────────
    A bar chart shows nine numbers. A radar shows the SHAPE of a route — you can
@@ -1712,10 +1751,19 @@ function sliderPanel() {
       <button data-preset="green">Max greenery</button>
       <button data-preset="nogreen">Avoid green</button>
     </div>
-    <button class="replan" id="replan">Find new routes for these weights</button>
-    <p style="font-size:10.5px;color:var(--dim);margin:7px 0 0;line-height:1.5">
-      Moving a slider re-ranks the loops you already have. This asks for
-      <em>new</em> loops aimed at, or away from, the nearest parks.</p>
+    <div class="dial">
+      <label style="margin-bottom:6px">Head for the green</label>
+      <div class="sl" style="grid-template-columns:64px 1fr 64px">
+        <span style="font-size:10px">avoid</span>
+        <input type="range" min="-100" max="100" value="0" id="greendial">
+        <span style="font-size:10px;text-align:right">seek out</span>
+      </div>
+      <button class="replan" id="replan">Find new routes at this setting</button>
+      <p style="font-size:10.5px;color:var(--dim);margin:7px 0 0;line-height:1.5">
+        The sliders above re-rank the loops you already have, instantly. This dial
+        asks for <em>new</em> loops, aimed at the nearest parks or away from them.
+        The further you push it, the more of the six candidates chase the green.</p>
+    </div>
     <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
   </div>`;
 }
