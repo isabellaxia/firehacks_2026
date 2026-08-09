@@ -29,7 +29,7 @@ def seed_demo_files():
     main_py = os.path.join(WORKSHOP_DIR, "main.py")
     if not os.path.exists(main_py):
         with open(main_py, "w", encoding="utf-8") as f:
-            f.write('# AI Code Editor Sandbox\n\ndef main():\n    print("Hello from main.py!")\n    print("1 + 1 =", 1 + 1)\n\nif __name__ == "__main__":\n    main()\n')
+            f.write('# AI Code Editor Sandbox\n\ndef add(a, b):\n    return a + b\n\nif __name__ == "__main__":\n    result = add(10, 25)\n    print(f"Addition Result: 10 + 25 = {result}")\n')
     readme_md = os.path.join(WORKSHOP_DIR, "README.md")
     if not os.path.exists(readme_md):
         with open(readme_md, "w", encoding="utf-8") as f:
@@ -110,7 +110,7 @@ def create_file(req: CreateFileRequest):
     os.makedirs(os.path.dirname(target), exist_ok=True)
     try:
         with open(target, "w", encoding="utf-8") as f:
-            f.write("")
+            f.write("# New File\n")
         return {"status": "success", "message": f"Created {req.path}"}
     except Exception as err:
         raise HTTPException(status_code=500, detail=str(err))
@@ -131,41 +131,93 @@ def delete_file(req: DeleteFileRequest):
         raise HTTPException(status_code=500, detail=str(err))
 
 # -----------------------------------------------------------------------------
-# 3. AI & Command Execution Engine
+# 3. Intelligent AI Code Generator & Execution Engine
 # -----------------------------------------------------------------------------
 def local_fallback_command(prompt: str) -> dict:
     p = prompt.lower().strip()
-    if "run" in p and ("python" in p or ".py" in p or "main" in p):
+
+    # Addition / Math / Calculator
+    if "addition" in p or "add" in p or "sum" in p or "calculator" in p or "plus" in p:
+        code = '''# Addition Code Generator
+def process_addition(num1, num2):
+    return num1 + num2
+
+if __name__ == "__main__":
+    a = 15
+    b = 27
+    total = process_addition(a, b)
+    print(f"--- ADDITION PROCESSOR ---")
+    print(f"Input A: {a}")
+    print(f"Input B: {b}")
+    print(f"Result : {a} + {b} = {total}")
+'''
+        cmd = f"cat << 'EOF' > addition.py\n{code}EOF\npython3 addition.py"
+        return {
+            "command": cmd,
+            "explanation": "Creates working addition.py Python code and executes it."
+        }
+
+    # Math Operations
+    elif "math" in p or "multiply" in p or "subtract" in p or "divide" in p:
+        code = '''# Math Calculator Code
+def calculate(a, b, operation):
+    if operation == "add": return a + b
+    if operation == "subtract": return a - b
+    if operation == "multiply": return a * b
+    if operation == "divide": return a / b if b != 0 else "Undefined"
+
+if __name__ == "__main__":
+    print("10 + 5 =", calculate(10, 5, "add"))
+    print("10 * 5 =", calculate(10, 5, "multiply"))
+    print("10 - 5 =", calculate(10, 5, "subtract"))
+'''
+        cmd = f"cat << 'EOF' > math_demo.py\n{code}EOF\npython3 math_demo.py"
+        return {
+            "command": cmd,
+            "explanation": "Creates working math_demo.py script and executes it."
+        }
+
+    # Sorting / Data Lists
+    elif "sort" in p or "list" in p or "array" in p:
+        code = '''# Sorting Data Demo
+numbers = [42, 12, 89, 7, 23, 56]
+sorted_nums = sorted(numbers)
+print("Original Unsorted:", numbers)
+print("Sorted Output   :", sorted_nums)
+'''
+        cmd = f"cat << 'EOF' > sort_demo.py\n{code}EOF\npython3 sort_demo.py"
+        return {
+            "command": cmd,
+            "explanation": "Creates working sort_demo.py script and runs it."
+        }
+
+    # General Code Creation Request
+    elif "code" in p or "script" in p or "python" in p or "make" in p or "create" in p or "write" in p:
         match = re.search(r'([a-zA-Z0-9_\-]+\.py)', prompt)
-        fname = match.group(1) if match else "main.py"
-        return {"command": f"python3 {fname}", "explanation": f"Executes Python script '{fname}'."}
-    elif "create" in p or "make" in p or "touch" in p:
-        if "folder" in p or "directory" in p or "mkdir" in p:
-            match = re.search(r'(?:folder|directory|named|called)\s+([a-zA-Z0-9_\-]+)', p)
-            dirname = match.group(1) if match else "data"
-            return {"command": f"mkdir -p {dirname}", "explanation": f"Creates directory '{dirname}'."}
-        else:
-            match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
-            filename = match.group(1) if match else "app.py"
-            if filename.endswith(".py"):
-                cmd = f"echo 'print(\"Hello from {filename}!\")' > {filename}"
-            else:
-                cmd = f"echo 'Sample content' > {filename}"
-            return {"command": cmd, "explanation": f"Creates file '{filename}'."}
-    elif "list" in p or "ls" in p or "show files" in p:
-        return {"command": "ls -la", "explanation": "Lists all files in workshop."}
-    elif "find" in p or "python" in p:
+        fname = match.group(1) if match else "app.py"
+        code = f'''# Generated Python Script: {fname}
+def run_process():
+    items = [10, 20, 30, 40]
+    total = sum(items)
+    print(f"Processed items {{items}}")
+    print(f"Calculated Total Sum = {{total}}")
+
+if __name__ == "__main__":
+    run_process()
+'''
+        cmd = f"cat << 'EOF' > {fname}\n{code}EOF\npython3 {fname}"
+        return {
+            "command": cmd,
+            "explanation": f"Creates working {fname} script and executes it."
+        }
+
+    # Terminal Commands
+    elif "ls" in p or "list files" in p:
+        return {"command": "ls -la", "explanation": "Lists all files in workshop sandbox."}
+    elif "find" in p:
         return {"command": "find . -name '*.py'", "explanation": "Finds all Python files."}
-    elif "disk" in p or "space" in p or "usage" in p:
-        return {"command": "du -sh *", "explanation": "Displays disk space used by workshop files."}
-    elif "read" in p or "cat" in p or "open" in p:
-        match = re.search(r'([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)', prompt)
-        filename = match.group(1) if match else "main.py"
-        return {"command": f"cat {filename}", "explanation": f"Prints content of '{filename}'."}
-    elif "1+1" in p or "calc" in p or "math" in p or "python -c" in p:
-        return {"command": "python3 -c 'print(1 + 1)'", "explanation": "Calculates 1 + 1 using Python."}
     else:
-        return {"command": f"echo 'Prompt: {prompt}'", "explanation": f"Processes request '{prompt}'."}
+        return {"command": f"python3 -c 'print(\"Processed: {prompt}\")'", "explanation": f"Processes request '{prompt}'."}
 
 @app.post("/api/ai-command")
 def generate_command(req: PromptRequest):
@@ -178,9 +230,9 @@ def generate_command(req: PromptRequest):
         try:
             client = OpenAI(base_url="https://api.featherless.ai/v1", api_key=api_key)
             system_prompt = (
-                "You are a command-line AI assistant operating strictly inside a local directory called './workshop'. "
-                "Translate the user's request into a single bash command. Respond ONLY with a raw JSON object:\n"
-                '{"command": "<shell command>", "explanation": "<1-2 sentence explanation>"}'
+                "You are an expert AI Python code generator and command assistant operating inside local './workshop'. "
+                "If the user asks to write, create, make, or update code, respond with a single bash command that creates the file using cat << 'EOF' > filename.py and executes python3 filename.py. "
+                "Respond ONLY with a raw JSON object: {\"command\": \"<bash command>\", \"explanation\": \"<1 sentence description>\"}"
             )
             response = client.chat.completions.create(
                 model="meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -228,7 +280,7 @@ def execute_command(req: ExecuteRequest):
         return {"command": cmd, "stdout": "", "stderr": f"Error: {str(err)}", "returncode": 1}
 
 # -----------------------------------------------------------------------------
-# 4. Instant Interactive Web Frontend (Zero JS Syntax Errors)
+# 4. Instant Web Frontend (Auto Opens Generated Files in Code Editor)
 # -----------------------------------------------------------------------------
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -468,12 +520,11 @@ HTML_CONTENT = """<!DOCTYPE html>
             <div class="section-header" style="margin-top: 12px;">
                 <span>AI Command Templates</span>
             </div>
+            <button class="template-btn" onclick="runAiPrompt('make a code to process addition')">➕ Code Addition Processor</button>
             <button class="template-btn" onclick="directExecuteCommand('python3 main.py', 'Executing main.py')">▶️ Run main.py</button>
             <button class="template-btn" onclick="directExecuteCommand('ls -la', 'Listing files')">📂 List files (ls -la)</button>
-            <button class="template-btn" onclick="runAiPrompt('Create a file named app.py with print statement')">📝 Create app.py</button>
-            <button class="template-btn" onclick="runAiPrompt('Find python files in workshop')">🔍 Find python files</button>
+            <button class="template-btn" onclick="runAiPrompt('Create a python script to sort a list')">🔢 Code Sorting Demo</button>
             <button class="template-btn" onclick="runAiPrompt('Create a folder named data')">📁 Create data folder</button>
-            <button class="template-btn" onclick="directExecuteCommand('cat main.py', 'Viewing main.py')">📖 Read main.py</button>
         </div>
 
         <div class="content-area">
@@ -493,12 +544,12 @@ HTML_CONTENT = """<!DOCTYPE html>
                     <span>Terminal Log Output</span>
                     <button class="action-btn-sm" onclick="clearLog()">🗑️ Clear Log</button>
                 </div>
-                <div class="terminal-log" id="terminalLog"><span class="log-system">[SYSTEM] Interactive Code Editor & Terminal initialized.</span>
-<span class="log-system">[SYSTEM] Click [▶️ RUN FILE] above or type commands below to execute live in ./workshop.</span>
+                <div class="terminal-log" id="terminalLog"><span class="log-system">[SYSTEM] Interactive Code Editor & AI Generator initialized.</span>
+<span class="log-system">[SYSTEM] Type prompts like 'make a code to process addition' to generate working Python scripts.</span>
 --------------------------------------------------------------------------------------------------</div>
                 <div class="input-bar">
-                    <input type="text" class="prompt-input" id="promptInput" placeholder="Type command (e.g. 'python3 main.py', 'ls -la', 'Create app.py')...">
-                    <button class="submit-btn" id="submitBtn" onclick="submitInput()">RUN COMMAND</button>
+                    <input type="text" class="prompt-input" id="promptInput" placeholder="Type prompt e.g. 'make a code to process addition'...">
+                    <button class="submit-btn" id="submitBtn" onclick="submitInput()">RUN PROMPT</button>
                 </div>
             </div>
         </div>
@@ -696,6 +747,15 @@ HTML_CONTENT = """<!DOCTYPE html>
             }
             if (!result.stdout && !result.stderr) {
                 appendLog('<span class="log-system">[Done] (exit code ' + result.returncode + ')</span>');
+            }
+
+            // Check if command created/updated a .py file and auto-open it in editor!
+            var match = cmd.match(/([a-zA-Z0-9_-]+\\.py)/);
+            if (match && match[1]) {
+                var targetPy = match[1];
+                setTimeout(function() {
+                    openFile(targetPy);
+                }, 300);
             }
         } catch (err) {
             appendLog('<span class="log-stderr">[ERROR] ' + escapeHtml(String(err)) + '</span>');
