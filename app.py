@@ -25,6 +25,7 @@ class PromptRequest(BaseModel):
 
 class ExecuteRequest(BaseModel):
     command: str
+    input_data: str = ""  # New parameter: holds the custom input you want to send to the script
 
 def local_fallback_command(prompt: str) -> dict:
     """
@@ -34,30 +35,27 @@ def local_fallback_command(prompt: str) -> dict:
     clean_prompt = prompt.lower()
     main_py_path = os.path.join(WORKSHOP_DIR, "main.py")
     
-    # Check if a dynamic math/calculation operation is requested
-    if "math" in clean_prompt or "calc" in clean_prompt or "addition" in clean_prompt:
+    # Updated Fallback: Handles an input prompt out-of-the-box for verification testing
+    if "input" in clean_prompt or "user" in clean_prompt:
+        code_content = (
+            "import sys\n\n"
+            "if __name__ == '__main__':\n"
+            "    print('Please enter your custom input text below:')\n"
+            "    user_response = input('>> ')\n"
+            "    print(f'Script processed incoming data: {user_response}')\n"
+        )
+        explanation = "Generated an interactive user-input data capturing script."
+    elif "math" in clean_prompt or "calc" in clean_prompt or "addition" in clean_prompt:
         code_content = (
             "import sys\n\n"
             "def calculate(a, b):\n"
             "    return a + b\n\n"
             "if __name__ == '__main__':\n"
-            "    # Sample fallback verification execution\n"
             "    res = calculate(10, 5)\n"
             "    print(f'Fallback Calculator Output (10 + 5): {res}')\n"
         )
         explanation = "Generated a local analytical math execution script."
-    elif "sort" in clean_prompt or "array" in clean_prompt or "list" in clean_prompt:
-        code_content = (
-            "import sys\n\n"
-            "def sort_elements(data):\n"
-            "    return sorted(data)\n\n"
-            "if __name__ == '__main__':\n"
-            "    res = sort_elements([42, 7, 19, 1, 88])\n"
-            "    print(f'Fallback Sorting Output: {res}')\n"
-        )
-        explanation = "Generated a local structural array organization script."
     else:
-        # Default fallback catch-all configuration script
         code_content = (
             "import sys\n\n"
             "if __name__ == '__main__':\n"
@@ -65,7 +63,6 @@ def local_fallback_command(prompt: str) -> dict:
         )
         explanation = "Generated a primary template echo diagnostic script."
 
-    # Escaping string single quotes accurately for bash block transmission
     escaped_code = code_content.replace("'", "'\\''")
     command = f"cat << 'EOF' > {main_py_path}\n{escaped_code}EOF\npython3 {main_py_path}"
     
@@ -83,7 +80,6 @@ def generate_command(req: PromptRequest):
     if not prompt:
         raise HTTPException(status_code=400, detail="Empty prompt string received.")
 
-    # 1. Harvest workspace file system states to construct persistent contextual memory
     active_code_context = ""
     main_py_path = os.path.join(WORKSHOP_DIR, "main.py")
     if os.path.exists(main_py_path):
@@ -93,7 +89,6 @@ def generate_command(req: PromptRequest):
         except Exception as err:
             print(f"Non-fatal error reading workspace file context: {err}")
 
-    # 2. Extract API Key (prioritizes target Featherless key configurations before OpenAI fallbacks)
     api_key = os.environ.get("FEATHERLESS_API_KEY") or os.environ.get("OPENAI_API_KEY")
     base_url = "https://api.featherless.ai/v1" if os.environ.get("FEATHERLESS_API_KEY") else "https://api.openai.com/v1"
     model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct" if os.environ.get("FEATHERLESS_API_KEY") else "gpt-4o-mini"
@@ -104,7 +99,8 @@ def generate_command(req: PromptRequest):
             
             system_prompt = (
                 "You are an elite, autonomous AI software developer working inside a workspace directory `./workshop`.\n"
-                "Your objective is to fully implement the user's prompt by writing clean, modular Python scripts.\n\n"
+                "Your objective is to fully implement the user's prompt by writing clean, modular Python scripts.\n"
+                "You can safely design scripts that request interactive terminal input via input().\n\n"
                 "CRITICAL RULES:\n"
                 "1. If modifying the primary script, target functional modifications directly to `./workshop/main.py`.\n"
                 "2. If creating a brand new independent module, use a clean filename descriptive of the task.\n"
@@ -131,13 +127,10 @@ def generate_command(req: PromptRequest):
             
             content = response.choices[0].message.content.strip()
             
-            # Sanitization layers to drop raw markdown code block tags if erroneously returned by the LLM
             if content.startswith("```"):
                 lines = content.splitlines()
-                if lines[0].startswith("```"): 
-                    lines = lines[1:]
-                if lines and lines[-1].startswith("```"): 
-                    lines = lines[:-1]
+                if lines[0].startswith("```"): lines = lines[1:]
+                if lines and lines[-1].startswith("```"): lines = lines[:-1]
                 content = "\n".join(lines).strip()
             
             data = json.loads(content)
@@ -146,14 +139,13 @@ def generate_command(req: PromptRequest):
                 "explanation": str(data.get("explanation", "")).strip()
             }
         except Exception as e:
-            # Drop cleanly down to local parser string tracking if exceptions occur
             print(f"LLM Processing Exception encountered: {str(e)}")
             pass
 
     return local_fallback_command(prompt)
 
 # -----------------------------------------------------------------------------
-# REST Endpoint: Shell Execution Sandbox Pipeline Engine
+# REST Endpoint: Interactive Shell Execution Sandbox Pipeline Engine
 # -----------------------------------------------------------------------------
 @app.post("/api/execute")
 def execute_command(req: ExecuteRequest):
@@ -162,26 +154,31 @@ def execute_command(req: ExecuteRequest):
         raise HTTPException(status_code=400, detail="Empty shell command payload.")
         
     try:
-        # Run execution instructions out of the workspace directory with specific system timeouts
-        result = subprocess.run(
+        # Popen process pipeline initialization to allow handling dynamic inputs/outputs
+        process = subprocess.Popen(
             command,
             shell=True,
             cwd=os.getcwd(),
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            timeout=15
+            text=True
         )
         
+        # Pipelines input data directly to the runtime workspace standard stream channel
+        stdout, stderr = process.communicate(input=req.input_data, timeout=15)
+        
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.returncode
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": process.returncode
         }
     except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
         return {
-            "stdout": "",
-            "stderr": "Execution process killed automatically: Time limit exceeded (15s limit).",
+            "stdout": stdout,
+            "stderr": stderr + "\n[Execution terminated automatically: Timeout limit of 15s reached]",
             "exit_code": -1
         }
     except Exception as e:
@@ -193,6 +190,5 @@ def execute_command(req: ExecuteRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # Bind engine pipelines locally for system initialization verification
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
