@@ -531,19 +531,19 @@ def offset(lat: float, lon: float, bearing_deg: float, metres: float):
 
 
 def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
-                 emphasis: list[str] | None = None, n: int = 6,
+                 emphasis: list[str] | None = None, n: int = 10,
                  hotspots: list | None = None, green_bias: float = 0.0) -> list[dict]:
-    """Candidate loops that are actually different from one another.
+    """Candidate loops that actually come back the length you asked for.
 
-    OpenRouteService's round_trip helper reseeded a few times tends to return the
-    same loop with minor variations, which is useless: re-weighting the score can
-    only choose between the routes you gave it. So instead of reseeding, we send
-    the loop off in a different COMPASS DIRECTION each time — two via-points placed
-    on a bearing, routed start -> p1 -> p2 -> start. Six bearings, six loops that
-    fan out across the map and genuinely trade off against each other.
+    Placing our own via-points let us aim a loop in a chosen direction, but it gave
+    no control over length: a point two kilometres away with no footpath to it makes
+    the router detour for tens of kilometres, which is how a five mile request came
+    back as fifty.
 
-    Preferences also change the request itself: asking for a safe route makes ORS
-    avoid steps and ferries, so the geometry differs too, not just the ranking.
+    So we use OpenRouteService's own round_trip instead, which takes the target
+    length directly and honours it. Variety comes from seeding it many different
+    ways rather than from steering it, and the greenery ladder is then built by
+    measuring the results and sorting them.
     """
     if not ORS_KEY:
         raise RuntimeError("ORS_API_KEY is not set")
@@ -556,57 +556,23 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
     elif "flat" in emphasis:
         avoid = ["steps"]
 
-    # A triangle start -> p1 -> p2 -> start of side r has perimeter about 3r along
-    # straight lines; real streets add roughly 25%, so aim a little short.
-    r = target_m / 4.0
-    # Alternating the reach as well as the bearing pushes some loops further out,
-    # where the streets, surfaces and greenery genuinely differ from the blocks
-    # right around the start.
-    # Reach stays in a narrow band so every candidate lands near the requested
-    # distance. Direction is what varies, not length.
-    spread = [(0, 1.0), (60, 0.92), (120, 1.08), (180, 1.0), (240, 0.92), (300, 1.08)]
-
-    # green_bias > 0 means the runner wants greenery: aim loops straight at the
-    # densest parks nearby. green_bias < 0 means they do not: aim away from them.
-    # Half the candidates follow the bias, half stay spread out, so there is always
-    # something to compare against.
-    # The bias is continuous, so the candidate mix should be too. At bias 0.3 one
-    # loop chases the nearest park; at 1.0 nearly all of them do, and they aim
-    # tighter. Nudging the slider nudges the route rather than flipping it.
-    # Six candidates spanning the greenery spectrum: level 0 heads away from the
-    # green land, level 5 heads straight into it, and the four between interpolate.
-    # The user then scrubs through them instantly instead of waiting for a re-plan.
-    bearings = []
-    if hotspots:
-        toward = hotspots[0]["bearing"]
-        away = (toward + 180.0) % 360.0
-        for i in range(n):
-            t = i / max(1, n - 1)                     # 0 = away, 1 = toward
-            # walk the short way round the circle from 'away' to 'toward'
-            diff = ((toward - away + 540) % 360) - 180
-            b = (away + diff * t) % 360
-            # nudge alternate levels sideways so no two loops overlap exactly
-            b = (b + (14 if i % 2 else -14)) % 360
-            bearings.append((b, 0.94 + 0.10 * t))
-    else:
-        bearings = spread[:n]
-    bearings = bearings[:n]
+    # (seed, waypoint count) pairs. Different seeds send the loop off in different
+    # directions; different point counts change how much it wanders.
+    specs = [(1, 3), (7, 4), (13, 5), (23, 3), (31, 4), (41, 5),
+             (53, 6), (67, 3), (79, 4), (97, 5)][:n]
 
     def one(spec):
-        """One bearing and reach, one loop. Parallel, or the request times out."""
-        b, scale = spec
-        rr = r * scale
-        p1 = offset(lat, lon, b, rr)
-        p2 = offset(lat, lon, b + 72, rr)
+        seed, points = spec
         body = {
-            "coordinates": [[lon, lat], [p1[1], p1[0]], [p2[1], p2[0]], [lon, lat]],
+            "coordinates": [[lon, lat]],
             "elevation": True,
             "instructions": True,
-            "preference": "shortest" if "exact" in emphasis else "recommended",
             "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
+            "options": {"round_trip": {"length": int(target_m), "points": points,
+                                       "seed": seed}},
         }
         if avoid:
-            body["options"] = {"avoid_features": avoid}
+            body["options"]["avoid_features"] = avoid
         try:
             resp = requests.post(ORS_URL.format(profile=profile), json=body,
                                  headers={"Authorization": ORS_KEY,
@@ -617,29 +583,8 @@ def fetch_routes(lat: float, lon: float, target_m: float, activity: str,
         except Exception as e:
             return {"error": str(e)}
 
-    # Six sequential calls at 30s each can exceed the platform request timeout, which
-    # returns an HTML error page and breaks the client. Fan out instead.
-    with cf.ThreadPoolExecutor(max_workers=6) as pool:
-        out = list(pool.map(one, bearings))
-
-    # If every bearing failed, fall back to the round_trip helper so the app still
-    # returns something rather than an empty page.
-    if not any("error" not in x for x in out):
-        for i in range(2):
-            body = {"coordinates": [[lon, lat]], "elevation": True, "instructions": True,
-                    "extra_info": ["surface", "waytype", "steepness", "green", "noise"],
-                    "options": {"round_trip": {"length": int(target_m), "points": 3 + i,
-                                               "seed": 1 + i * 11}}}
-            try:
-                resp = requests.post(ORS_URL.format(profile=profile), json=body,
-                                     headers={"Authorization": ORS_KEY,
-                                              "Content-Type": "application/json"},
-                                     timeout=15)
-                if resp.status_code == 200:
-                    out.append(resp.json())
-            except Exception:
-                pass
-    return out
+    with cf.ThreadPoolExecutor(max_workers=10) as pool:
+        return list(pool.map(one, specs))
 
 
 # ────────────────────────────────────────────────────────────── model calls
@@ -1095,12 +1040,28 @@ def _plan(req: PlanRequest):
         seen.add(sig)
         unique.append(r)
 
-    TOL = 40
-    on_target = [r for r in unique if abs(r["distance_error_pct"]) <= TOL]
-    if len(on_target) < 2:
-        # never return nothing: keep the closest few and say they are off target
-        on_target = sorted(unique, key=lambda r: abs(r["distance_error_pct"]))[:3]
-    routes = on_target[:6]
+    # Hard distance gate. Ask for five miles, get five miles.
+    for tol in (22, 35, 55):
+        on_target = [r for r in unique if abs(r["distance_error_pct"]) <= tol]
+        if len(on_target) >= 3:
+            break
+    else:
+        on_target = sorted(unique, key=lambda r: abs(r["distance_error_pct"]))[:4]
+
+    # Six rungs spanning the measured greenery range, so the ladder covers the whole
+    # spectrum rather than clustering at one end.
+    on_target.sort(key=lambda r: r["scores"]["green"])
+    if len(on_target) > 6:
+        step = (len(on_target) - 1) / 5.0
+        picked, seen_i = [], set()
+        for i in range(6):
+            j = round(i * step)
+            if j not in seen_i:
+                seen_i.add(j)
+                picked.append(on_target[j])
+        routes = picked
+    else:
+        routes = on_target
 
     spread = {}
     if len(routes) > 1:
@@ -1630,8 +1591,8 @@ function wireSliders() {
       showPull();
       rescore();
     });
-    // re-plan on release rather than on every pixel of the drag
-    inp.addEventListener('change', () => scheduleReplan());
+    // no re-planning here: the six loops are already loaded and the slider only
+    // chooses which one to show. New loops come from the button, and nowhere else.
   });
   showPull();
   const dial = document.getElementById('greendial');
@@ -1649,6 +1610,7 @@ function wireSliders() {
   const rp = document.getElementById('replan');
   if (rp) rp.addEventListener('click', async () => {
     const bias = (+((dial && dial.value) || 0)) / 100;
+    USER_W = null;
     rp.disabled = true;
     rp.innerHTML = '<span class="spin"></span>Finding new routes';
     try {
@@ -1847,27 +1809,13 @@ function sliderPanel() {
   const w = USER_W || DATA.weights.applied;
   return `<div class="sliders">
     <h4>Tune it yourself</h4>
-    <p>Every criterion pulls the route toward green land or toward the street grid.
-       Quiet, clean air and safety live in parks; smooth tarmac and simple navigation
-       live on streets. Move any slider and the loops are re-planned to match.</p>
+    <p>Move any slider to scrub through the six loops below. Quiet, clean air and
+       safety live in the green; smooth tarmac and simple navigation live on streets.</p>
     <div id="pulls" class="pullbar"></div>
     ${Object.keys(w).map(k => {
-      const sp = (DATA.spread || {})[k] ?? 99;
-      const byDesign = (DATA.uniform_by_design || []).includes(k);
-      const dead = sp < 0.5 && !byDesign;
-      const corr = CORR[k] ?? 0;
-      const pull = corr > 0.15 ? '<span style="color:#5FBF8B">&#8593; green</span>'
-                 : corr < -0.15 ? '<span style="color:#E8B84B">&#8595; streets</span>' : '';
-      const note = byDesign
-        ? ' <span style="font-size:9px">(same for all)</span>'
-        : dead ? ' <span style="font-size:9px">(tied)</span>' : '';
-      return `<div class="sl" title="${byDesign
-        ? 'Measured once at your start point, so it is identical for every candidate'
-        : dead
-        ? 'Every candidate scores the same here, so this slider cannot change the ranking'
-        : 'Candidates differ by ' + sp + ' points on this criterion'}">
-      <span style="${dead ? 'opacity:.45' : ''}" title="${esc(EXPLAIN[k] || '')}">${
-        esc(LABELS[k] || k)}${note} ${pull}</span>
+      const note = '';
+      return `<div class="sl">
+      <span title="${esc(EXPLAIN[k] || '')}">${esc(LABELS[k] || k)}</span>
       <input type="range" min="0" max="40" value="${Math.round(w[k] * 100)}"
         data-w="${k}" ${dead ? 'style="opacity:.4"' : ''}>
       <b data-wv="${k}">${(w[k] * 100).toFixed(0)}</b></div>`;
@@ -1885,10 +1833,6 @@ function sliderPanel() {
         <input type="range" min="-100" max="100" value="0" id="greendial">
         <span style="font-size:10px;text-align:right">seek out</span>
       </div>
-      <p style="font-size:10.5px;color:var(--dim);margin:7px 0 0;line-height:1.5">
-        Every loop below was planned at a different greenery level, least green on
-        the left. Drag this, or any slider above, to scrub through them — it is
-        instant, because all six are already loaded.</p>
       <button class="replan" id="replan">Plan a fresh set of loops</button>
     </div>
     <div class="reorder" id="reorder">The ranking changed — a different loop now wins.</div>
